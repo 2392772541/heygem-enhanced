@@ -1,0 +1,7 @@
+{
+  "description": "HeyGem 模特视频源文件映射配置。将本文件重命名或复制为 model_sources.local.json 即可生效",
+  "mappings": {
+    "1": "D:\\\\backups\\\\models\\\\model_1.mp4",
+    "2": "D:\\\\backups\\\\models\\\\model_2.mp4"
+  }
+}

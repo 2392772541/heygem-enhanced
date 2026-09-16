@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HeyGem-Enhanced 跨机器环境配置说明 (可选覆盖项)",
+  "description": "系统会自动智能探测所有默认路径。如需特殊自定义盘符或目录，可在系统环境变量或本配置中指定",
+  "env_variables": {
+    "HEYGEM_DB_OVERRIDE": {
+      "default": "%APPDATA%\\Duix.Avatar\\biz.db",
+      "description": "Duix.Avatar 客户端 SQLite 业务数据库绝对路径"
+    },
+    "HEYGEM_OUTPUT_ROOT": {
+      "default": "D:\\duix_avatar_data\\face2face\\temp (若不存在自动检测 C:)",
+      "description": "Docker 容器生成音视频的临时工作目录"
+    },
+    "HEYGEM_DELIVERY_ROOT": {
+      "default": "E:\\数字人视频文件 (若不存在自动检测 D: 或 桌面)",
+      "description": "成片自动交付导出的归档目录"
+    },
+    "HEYGEM_VOICE_ROOT": {
+      "default": "D:\\duix_avatar_data\\voice\\data",
+      "description": "模特与声音原始参考音频存放目录"
+    },
+    "HEYGEM_INDEXTTS2_ROOT": {
+      "default": "D:\\HeyGem\\tts-story-f5",
+      "description": "本地 IndexTTS2 项目所在根目录"
+    },
+    "HEYGEM_ADAPTER_PYTHON": {
+      "default": "%HEYGEM_INDEXTTS2_ROOT%\\venv\\Scripts\\python.exe",
+      "description": "运行 IndexTTS2 适配服务的专有 Python 虚拟环境"
+    },
+    "HEYGEM_CLIENT_EXE": {
+      "default": "C:\\Program Files\\Duix.Avatar\\Duix.Avatar.exe",
+      "description": "Duix.Avatar 桌面客户端主程序安装路径"
+    },
+    "HEYGEM_MODE_FILE": {
+      "default": "项目根目录\\tts-mode.txt",
+      "description": "当前语音模式标记文件 (index-tts2 或 fish-speech)"
+    }
+  }
+}

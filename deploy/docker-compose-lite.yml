@@ -1,0 +1,26 @@
+networks:
+  ai_network:
+    driver: bridge
+
+services:
+  duix-avatar-gen-video:
+    image: guiji2025/duix.avatar
+    container_name: duix-avatar-gen-video
+    restart: "no"
+    runtime: nvidia
+    privileged: true
+    volumes:
+      - ${DUIX_DATA_DIR:-d:/duix_avatar_data}/face2face:/code/data
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    shm_size: '8g'
+    ports:
+      - '8383:8383'
+    command: python /code/app_local.py
+    networks:
+      - ai_network
