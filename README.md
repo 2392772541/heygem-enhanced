@@ -1,4 +1,4 @@
-# HeyGem-Enhanced (数字人全链条增强调度与生产就绪工程)
+﻿# HeyGem-Enhanced (数字人全链条增强调度与生产就绪工程)
 
 基于官方 **Duix.Avatar (HeyGem)** 深度二次开发与生产级加固的数字人音视频生成中枢。针对原版系统在多任务并发、排队死锁、Docker 容器冲突、音视频交付以及语音合成扩展性上的多项痛点，进行了彻底的架构重构与自愈机制增强。
 
@@ -92,6 +92,12 @@ HeyGem-Enhanced/
 
 ### 第一步：基础运行环境准备
 1. **安装 Git 与 Python**：推荐 Python 3.10 或 3.11（安装时勾选 `Add python.exe to PATH`）。
+   - **调度器核心零依赖**：主队列调度器与所有维护脚本完全使用 Python 标准库，无需额外 pip 安装。
+   - **双模 TTS 可选依赖**：若需使用 IndexTTS2 高保真语音克隆，可在克隆后执行：
+     ```powershell
+     pip install -r adapter\requirements.txt
+     ```
+     *(注：若未安装或未部署 IndexTTS2，系统启动时会自动智能降级为内置官方 Fish-Speech 模式，不影响数字人视频渲染。)*
 2. **安装 Docker Desktop**：
    - 启用 WSL2 后端；
    - 确保安装并启用 NVIDIA Container Toolkit（NVIDIA 显卡驱动需支持 CUDA）。

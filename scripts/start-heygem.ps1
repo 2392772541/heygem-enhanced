@@ -195,6 +195,24 @@ function Get-AdapterPython {
   return (Get-QueuePython)
 }
 
+function Test-IndexTtsAvailable {
+  if (-not (Test-Path $adapterScript)) {
+    return $false
+  }
+  $adapterPy = Get-AdapterPython
+  if (-not (Test-Path $adapterPy) -and $adapterPy -ne 'python.exe') {
+    return $false
+  }
+  try {
+    $testOut = & $adapterPy -c "import flask, soundfile, numpy; print('OK')" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $testOut -match 'OK') {
+      return $true
+    }
+  } catch {
+  }
+  return $false
+}
+
 function Test-DockerReady {
   cmd.exe /c "docker version --format ""{{.Server.Version}}"" >nul 2>nul" | Out-Null
   return ($LASTEXITCODE -eq 0)
@@ -415,6 +433,11 @@ if (-not (Test-Path $composeDir)) {
 }
 
 $selectedMode = Get-TtsMode
+if ($selectedMode -eq 'index-tts2' -and -not (Test-IndexTtsAvailable)) {
+  Write-Log "提示: 检测到当前配置为 index-tts2 模式，但本机未发现可运行的 IndexTTS2 依赖环境 (Python + Flask/SoundFile 等)。"
+  Write-Log "为确保系统开箱即用，本次自动平滑降级为官方 Docker Fish-Speech 模式启动。"
+  $selectedMode = 'fish-speech'
+}
 Write-Log ("Selected TTS mode: {0}" -f $selectedMode)
 Write-Log ("Queue mode file: {0}" -f $modeFile)
 Write-Log ("Queue Python: {0}" -f (Get-QueuePython))

@@ -23,7 +23,7 @@ $queueStdoutLog = Join-Path $logDir 'heygem-queue-daemon.out.log'
 $queueStderrLog = Join-Path $logDir 'heygem-queue-daemon.err.log'
 $guardLog = Join-Path $logDir 'heygem-queue-guard.log'
 
-$appDataDir = if ($env:APPDATA) { $env:APPDATA } else { Join-Path [Environment]::GetFolderPath('ApplicationData') 'Duix.Avatar' }
+$appDataDir = if ($env:APPDATA) { $env:APPDATA } else { [Environment]::GetFolderPath('ApplicationData') }
 $appLogPath = if ($env:HEYGEM_MAIN_LOG) { $env:HEYGEM_MAIN_LOG } else { Join-Path $appDataDir 'Duix.Avatar\logs\main.log' }
 
 $recent500WindowSeconds = 180
