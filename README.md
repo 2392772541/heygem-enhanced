@@ -1,4 +1,4 @@
-﻿# HeyGem-Enhanced (数字人全链条增强调度与生产就绪工程)
+# HeyGem-Enhanced (数字人全链条增强调度与生产就绪工程)
 
 基于官方 **Duix.Avatar (HeyGem)** 深度二次开发与生产级加固的数字人音视频生成中枢。针对原版系统在多任务并发、排队死锁、Docker 容器冲突、音视频交付以及语音合成扩展性上的多项痛点，进行了彻底的架构重构与自愈机制增强。
 
@@ -36,6 +36,9 @@ HeyGem-Enhanced/
 ├── Start-HeyGem.bat                  # [根目录便捷入口] 一键启动完整服务链
 ├── Stop-HeyGem.bat                   # [根目录便捷入口] 一键安全优雅停止
 ├── Install-Shortcuts.bat             # [根目录便捷入口] 一键在桌面创建分类启动器
+├── .env.example                      # 跨机器环境变量配置模板 (可选覆盖)
+├── requirements.txt                  # 运行依赖说明 (核心零依赖，包含 adapter 扩展)
+├── LICENSE                           # Apache-2.0 开源协议
 ├── heygem.config.example.json        # 环境变量与高级路径配置示例
 ├── tts-mode.txt                      # 当前 TTS 模式指示文件 (index-tts2 / fish-speech)
 │
@@ -70,6 +73,7 @@ HeyGem-Enhanced/
 │   └── Bulk-Delete-Works.bat
 │
 ├── deploy/                           # Docker 部署配置文件 (优化版)
+│   ├── README.md                     # 4 套 Compose 编排方案对比与选型指南
 │   ├── docker-compose.yml            # 主容器配置 (restart: "no", 修复10095端口)
 │   ├── docker-compose-lite.yml       # 纯视频生成极简配置
 │   ├── docker-compose-5090.yml       # RTX 5090 / 新显卡专有配置
@@ -165,17 +169,20 @@ Install-Shortcuts.bat
 
 ## 5. 高级配置与环境变量覆盖
 
-系统默认使用智能路径探测。如果在新电脑上盘符不同（例如只有 C 盘或安装在 F 盘），无需修改任何代码，只需设置对应的系统环境变量即可（或参考 `heygem.config.example.json`）：
+系统默认具备完全自动的智能路径嗅探。如果在新电脑上盘符不同（例如只有 C 盘或数据挂载在 F 盘），无需修改任何代码，系统支持直接复制 `.env.example` 为 `.env`，或在系统环境变量中覆盖指定（亦可参考 `heygem.config.example.json`）：
 
 | 环境变量名 | 默认探测逻辑 | 说明 |
 | :--- | :--- | :--- |
-| `HEYGEM_DB_OVERRIDE` | `%APPDATA%\Duix.Avatar\biz.db` | 客户端 SQLite 数据库路径 |
+| `DUIX_DATA_DIR` | `d:/duix_avatar_data` | Docker 容器映射的数据根目录 (挂载 face2face 与 voice/data) |
+| `HEYGEM_DB_OVERRIDE` | `%APPDATA%\Duix.Avatar\biz.db` | 客户端 SQLite 业务数据库绝对路径 |
 | `HEYGEM_OUTPUT_ROOT` | `D:\duix_avatar_data\face2face\temp` -> `C:\...` | Docker 渲染音视频工作目录 |
-| `HEYGEM_DELIVERY_ROOT` | `E:\数字人视频文件` -> `D:\...` -> `桌面\数字人视频文件` | 成品自动交付导出归档目录 |
+| `HEYGEM_DELIVERY_ROOT` | `E:\数字人视频文件` -> `D:\...` -> `桌面\数字人视频文件` | 成品自动交付导出归档目录 (自动 ffprobe 与哈希校验) |
 | `HEYGEM_VOICE_ROOT` | `D:\duix_avatar_data\voice\data` -> `C:\...` | 模特音频与参考音存放目录 |
 | `HEYGEM_INDEXTTS2_ROOT` | `D:\HeyGem\tts-story-f5` | IndexTTS2 项目代码根目录 |
 | `HEYGEM_ADAPTER_PYTHON` | `%HEYGEM_INDEXTTS2_ROOT%\venv\Scripts\python.exe` | 运行 IndexTTS2 服务的 Python 环境 |
 | `HEYGEM_CLIENT_EXE` | `C:\Program Files\Duix.Avatar\Duix.Avatar.exe` | 桌面端客户端可执行文件路径 |
+| `HEYGEM_MODE_FILE` | `tts-mode.txt` | 当前 TTS 模式指示文件 (index-tts2 或 fish-speech) |
+| `COMPOSE_FILE` | `deploy/docker-compose.yml` | 指定使用的 Docker 编排配置 (可选 5090/lite/linux，详见 `deploy/README.md`) |
 
 ---
 

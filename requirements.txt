@@ -1,0 +1,15 @@
+# ==============================================================================
+# HeyGem-Enhanced 运行环境与依赖说明
+# ==============================================================================
+#
+# [架构设计说明]
+# 1. 核心队列调度器 (core/heygem_queue_runner.py)、看门狗守护 (core/heygem-queue-guard.ps1)
+#    以及所有维护管理工具 (scripts/*.py, scripts/*.ps1) 均采用 Python 3.8+ 标准库编写：
+#    - sqlite3, urllib, subprocess, pathlib, logging, hashlib, json, time, os 等
+#    - 核心功能实现【零外部依赖 (Zero External Dependencies)】，克隆代码后直接运行！
+#
+# 2. 若您需要启用增强型双模语音（本地 IndexTTS2 适配服务 / adapter 目录）：
+#    IndexTTS2 适配层需要轻量级 Web 框架支持（FastAPI / Uvicorn / Requests）。
+#    如需运行适配器，可直接安装下方依赖（或执行 pip install -r adapter/requirements.txt）：
+#
+-r adapter/requirements.txt
