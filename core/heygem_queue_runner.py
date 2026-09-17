@@ -1000,9 +1000,195 @@ def update_video(video_id: int, **fields: object) -> None:
         conn.close()
 
 
+def ensure_cancel_triggers(conn: sqlite3.Connection | None = None) -> None:
+    close_after = False
+    if conn is None:
+        conn = db()
+        close_after = True
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cancelled_video_tasks (
+                video_id INTEGER PRIMARY KEY,
+                code TEXT,
+                cancelled_at INTEGER
+            );
+            """
+        )
+        conn.execute("DROP TRIGGER IF EXISTS trg_video_record_cancelled")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_video_record_cancelled
+            AFTER DELETE ON video
+            WHEN OLD.status IN ('pending', 'waiting')
+              OR (
+                OLD.status NOT IN ('success', 'failed', 'draft')
+                AND OLD.code IS NOT NULL
+                AND trim(OLD.code) <> ''
+              )
+            BEGIN
+                INSERT OR REPLACE INTO cancelled_video_tasks (video_id, code, cancelled_at)
+                VALUES (OLD.id, OLD.code, CAST(strftime('%s', 'now') AS INTEGER));
+            END;
+            """
+        )
+        conn.commit()
+    finally:
+        if close_after:
+            conn.close()
+
+
+def is_video_cancelled(video_id: int, task_code: str | None = None) -> bool:
+    conn = db()
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM cancelled_video_tasks WHERE video_id = ?",
+            [video_id],
+        )
+        if cur.fetchone() is not None:
+            return True
+        norm_code = normalize_code(task_code)
+        if is_valid_task_code(norm_code):
+            cur = conn.execute(
+                "SELECT 1 FROM cancelled_video_tasks WHERE code = ? AND trim(code) <> ''",
+                [norm_code],
+            )
+            if cur.fetchone() is not None:
+                return True
+        cur = conn.execute("SELECT 1 FROM video WHERE id = ?", [video_id])
+        if cur.fetchone() is None:
+            return True
+        return False
+    except sqlite3.OperationalError:
+        try:
+            cur = conn.execute("SELECT 1 FROM video WHERE id = ?", [video_id])
+            return cur.fetchone() is None
+        except Exception:
+            return False
+    finally:
+        conn.close()
+
+
+def clear_cancelled_video_task(video_id: int, task_code: str | None = None) -> None:
+    conn = db()
+    try:
+        norm_code = normalize_code(task_code)
+        if is_valid_task_code(norm_code):
+            conn.execute(
+                "DELETE FROM cancelled_video_tasks WHERE video_id = ? OR code = ?",
+                [video_id, norm_code],
+            )
+        else:
+            conn.execute(
+                "DELETE FROM cancelled_video_tasks WHERE video_id = ?",
+                [video_id],
+            )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def is_gen_video_ready(timeout: int = 2) -> bool:
+    try:
+        res = http_get_json(F2F_QUERY_URL.format(code="__health_probe__"), timeout=timeout)
+        return int(res.get("code", -1)) in (10000, 10004)
+    except Exception:
+        return False
+
+
+def wait_for_gen_video_ready(timeout: int = 35) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_gen_video_ready(timeout=2):
+            return True
+        time.sleep(2)
+    return False
+
+
+def force_restart_gen_video_container(reason: str, wait_ready: bool = True) -> bool:
+    container_name = GEN_VIDEO_CONTAINER_NAME
+    log(f"[CANCEL] Force restarting {container_name} ({reason})")
+    try:
+        result = subprocess.run(
+            ["docker", "restart", container_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=180,
+        )
+    except Exception as exc:
+        log(f"[CANCEL] Force restart {container_name} failed: {exc}")
+        return False
+
+    now = time.time()
+    if result.returncode == 0:
+        _LAST_CONTAINER_RESTART_AT[container_name] = now
+        log(f"[CANCEL] Force restarted {container_name} successfully ({reason})")
+        clear_backend_busy_lock()
+        if wait_ready:
+            ready = wait_for_gen_video_ready(timeout=35)
+            if ready:
+                log(f"[CANCEL] {container_name} is back online and ready for new tasks")
+            else:
+                log(f"[CANCEL] {container_name} restart completed, probe timed out (will retry on next cycle)")
+        return True
+    else:
+        err = (result.stderr or "").strip() or (result.stdout or "").strip()
+        log(f"[CANCEL] Force restart {container_name} failed: {err}")
+        return False
+
+
+def process_cancelled_tasks() -> bool:
+    conn = db()
+    try:
+        rows = conn.execute("SELECT video_id, code, cancelled_at FROM cancelled_video_tasks").fetchall()
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+    if not rows:
+        return False
+
+    changed = False
+    for r in rows:
+        vid = int(r[0])
+        code = normalize_code(r[1])
+        log(f"[CANCEL] Found pending cancelled task record: video_id={vid}, code={code}")
+        if is_valid_task_code(code):
+            try:
+                res = http_get_json(F2F_QUERY_URL.format(code=code), timeout=10)
+                status_code = int(res.get("code", -1))
+                task_status = (res.get("data") or {}).get("status")
+            except Exception:
+                status_code = -1
+                task_status = None
+
+            if (status_code == 10000 and task_status == 1) or status_code == 10001:
+                log(f"[CANCEL] Task {vid} (code={code}) is active in backend (status={task_status}, code={status_code}); terminating...")
+                force_restart_gen_video_container(f"daemon aborting cancelled task {vid} code={code}", wait_ready=True)
+
+            try:
+                rel_result, out_file = final_mp4_for_code(code)
+                if out_file.exists():
+                    out_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        clear_cancelled_video_task(vid, code)
+        changed = True
+
+    return changed
+
+
 def ensure_retry_triggers() -> None:
     conn = db()
     try:
+        ensure_cancel_triggers(conn)
         conn.execute("DROP TRIGGER IF EXISTS trg_video_retryable_failed_update")
         conn.execute("DROP TRIGGER IF EXISTS trg_video_retryable_failed_insert")
         conn.execute("DROP TRIGGER IF EXISTS trg_video_protect_runner_pending")
@@ -1392,6 +1578,7 @@ def maybe_log_backend_busy_wait() -> None:
 
 
 def reset_stuck_rows() -> None:
+    process_cancelled_tasks()
     retryable_failed = fetch_all("SELECT id, message FROM video WHERE status='failed'")
     for row in retryable_failed:
         if is_retryable_failure_message(row["message"]):
@@ -1555,12 +1742,18 @@ def cleanup_other_runner_no_code_pending(current_video_id: int) -> None:
 
 
 def sync_pending_from_backend() -> bool:
-    changed = False
+    changed = process_cancelled_tasks()
     pending = fetch_all("SELECT * FROM video WHERE status='pending'")
     activity_ages: dict[str, float] | None = None
     for row in pending:
         video_id = int(row["id"])
         code = normalize_code(row["code"])
+        if is_video_cancelled(video_id, code):
+            log(f"[CANCEL] video {video_id} code={code} in sync_pending is cancelled, aborting backend")
+            force_restart_gen_video_container(f"cancelled pending video {video_id} code={code}", wait_ready=True)
+            clear_cancelled_video_task(video_id, code)
+            changed = True
+            continue
         code_key = code.lower()
         if not is_valid_task_code(code):
             continue
@@ -1850,6 +2043,9 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
 
     chunk_audios: list[bytes] = []
     for idx, chunk_text in enumerate(text_chunks, start=1):
+        if is_video_cancelled(int(video["id"])):
+            log(f"[CANCEL] video {video['id']} was cancelled during audio generation")
+            raise RuntimeError(f"video {video['id']} cancelled by user")
         payload = dict(base_payload)
         payload["text"] = chunk_text
         if len(text_chunks) > 1:
@@ -1923,10 +2119,28 @@ def poll_until_done(video_id: int, code: str) -> tuple[bool, dict]:
     consecutive_query_errors = 0
     while True:
         time.sleep(POLL_SECONDS)
+
+        if is_video_cancelled(video_id, code):
+            log(f"[CANCEL] video {video_id} (code={code}) was cancelled by user! Aborting render...")
+            force_restart_gen_video_container(f"user cancelled video {video_id} code={code}", wait_ready=True)
+            clear_cancelled_video_task(video_id, code)
+            try:
+                rel_result, out_file = final_mp4_for_code(code)
+                if out_file.exists():
+                    out_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False, {"msg": "Task cancelled by user", "cancelled": True}
+
         try:
             res = http_get_json(F2F_QUERY_URL.format(code=code), timeout=30)
             consecutive_query_errors = 0
         except Exception as exc:
+            if is_video_cancelled(video_id, code):
+                log(f"[CANCEL] video {video_id} (code={code}) was cancelled by user during query retry")
+                force_restart_gen_video_container(f"user cancelled video {video_id} code={code}", wait_ready=True)
+                clear_cancelled_video_task(video_id, code)
+                return False, {"msg": "Task cancelled by user", "cancelled": True}
             consecutive_query_errors += 1
             log(f"video {video_id} query network error: {exc}")
             if consecutive_query_errors >= 10:
@@ -1947,6 +2161,10 @@ def poll_until_done(video_id: int, code: str) -> tuple[bool, dict]:
             update_video(video_id, status="pending", message=msg, progress=progress)
             continue
         if status_code == 10000 and task_status == 2:
+            if is_video_cancelled(video_id, code):
+                log(f"[CANCEL] video {video_id} was cancelled right before completion, discarding output")
+                clear_cancelled_video_task(video_id, code)
+                return False, {"msg": "Task cancelled by user", "cancelled": True}
             return True, data
         if status_code == 10000 and task_status == 3:
             return False, {"msg": msg or "backend status=3"}
@@ -1970,11 +2188,32 @@ def run_one(video: sqlite3.Row) -> None:
         param=json.dumps({"_run_started_at_ms": run_started_at_ms, "_queue_owner": QUEUE_OWNER}, ensure_ascii=False),
     )
 
+    if is_video_cancelled(video_id):
+        log(f"[CANCEL] video {video_id} was cancelled before audio preparation, skipping")
+        clear_cancelled_video_task(video_id)
+        return
+
     audio_path = video["audio_path"]
-    if audio_path:
-        audio_name = str(audio_path)
-    else:
-        audio_name = make_audio_for_video(video, voice)
+    try:
+        if audio_path:
+            audio_name = str(audio_path)
+        else:
+            audio_name = make_audio_for_video(video, voice)
+    except Exception as exc:
+        if is_video_cancelled(video_id):
+            log(f"[CANCEL] video {video_id} cancelled during audio prep: {exc}")
+            clear_cancelled_video_task(video_id)
+            return
+        raise
+
+    if is_video_cancelled(video_id):
+        log(f"[CANCEL] video {video_id} was cancelled after audio prep, skipping submit")
+        try:
+            (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        clear_cancelled_video_task(video_id)
+        return
 
     if has_pending_with_code(exclude_video_id=video_id):
         update_video(
@@ -1992,6 +2231,15 @@ def run_one(video: sqlite3.Row) -> None:
 
     update_video(video_id, status="pending", message="Submitting task", audio_path=audio_name)
 
+    if is_video_cancelled(video_id):
+        log(f"[CANCEL] video {video_id} was cancelled right before submit, skipping submit")
+        try:
+            (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        clear_cancelled_video_task(video_id)
+        return
+
     submit_result, submit_param = submit_video_task(audio_name, str(model["video_path"]))
     submit_code = _coerce_int(submit_result.get("code"))
     submit_msg = str(submit_result.get("msg") or submit_result)
@@ -2000,6 +2248,10 @@ def run_one(video: sqlite3.Row) -> None:
     submit_param_with_meta["_queue_owner"] = QUEUE_OWNER
 
     if submit_code != 10000:
+        if is_video_cancelled(video_id):
+            log(f"[CANCEL] video {video_id} was cancelled during submit rejection")
+            clear_cancelled_video_task(video_id)
+            return
         if is_busy_submit_response(submit_result) or is_retryable_failure_message(submit_msg):
             active_code = find_matching_active_backend_code(audio_name, str(model["video_path"]))
             if active_code:
@@ -2061,6 +2313,13 @@ def run_one(video: sqlite3.Row) -> None:
 
     ok, data = poll_until_done(video_id, task_code)
     if not ok:
+        if data.get("cancelled"):
+            log(f"[CANCEL] video {video_id} aborted cleanly (task cancelled by user)")
+            try:
+                (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
         fail_msg = str(data.get("msg", "unknown error"))
         if is_retryable_failure_message(fail_msg):
             update_video(
@@ -2097,6 +2356,10 @@ def run_one(video: sqlite3.Row) -> None:
 
 
 def maybe_recover_retryable_video_error(video_id: int, exc: Exception) -> bool:
+    if is_video_cancelled(video_id):
+        log(f"[CANCEL] Task {video_id} was cancelled, skipping retry recovery")
+        clear_cancelled_video_task(video_id)
+        return True
     msg = str(exc or "")
     if not is_retryable_failure_message(msg):
         return False
@@ -2130,6 +2393,7 @@ def has_waiting() -> bool:
 
 def run_once() -> int:
     ensure_retry_triggers()
+    process_cancelled_tasks()
     sync_voice_reference_paths_for_mode()
     reset_stuck_rows()
     sync_pending_from_backend()
