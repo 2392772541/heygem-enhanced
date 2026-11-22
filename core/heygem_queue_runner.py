@@ -10,12 +10,34 @@ import sqlite3
 import subprocess
 import shutil
 import sys
+import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+try:
+    from studio.db import (
+        init_studio_schema,
+        probe_media_info,
+        resolve_pause_file,
+        sanitize_filename,
+        upsert_job_meta,
+    )
+except Exception:
+    init_studio_schema = None  # type: ignore[assignment]
+    probe_media_info = None  # type: ignore[assignment]
+    resolve_pause_file = None  # type: ignore[assignment]
+    sanitize_filename = None  # type: ignore[assignment]
+    upsert_job_meta = None  # type: ignore[assignment]
 
 
 def _resolve_db_path() -> Path:
@@ -87,8 +109,12 @@ def resolve_mode_file() -> Path | None:
             return candidate
     return candidates[0] if candidates else None
 TTS_INVOKE_URL = "http://127.0.0.1:18180/v1/invoke"
+TTS_STATUS_URL = "http://127.0.0.1:18180/v1/tts/status"
+TTS_CANCEL_URL = "http://127.0.0.1:18180/v1/tts/cancel"
 F2F_SUBMIT_URL = "http://127.0.0.1:8383/easy/submit"
 F2F_QUERY_URL = "http://127.0.0.1:8383/easy/query?code={code}"
+DEFAULT_MAX_RETRIES = 3
+TTS_SINGLE_BATCH_TIMEOUT_SECONDS = 1800
 def _resolve_ffprobe_exe() -> Path:
     override = os.getenv("HEYGEM_FFPROBE_EXE")
     if override and Path(override).exists():
@@ -375,9 +401,73 @@ def merge_wav_payloads(payloads: list[bytes], video_id: int) -> bytes:
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=20.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=15000")
+    except Exception:
+        pass
     return conn
+
+
+def get_pause_file() -> Path:
+    if resolve_pause_file is not None:
+        return resolve_pause_file()
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Duix.Avatar" / "heygem_queue_runner.paused"
+    return Path.home() / "AppData" / "Roaming" / "Duix.Avatar" / "heygem_queue_runner.paused"
+
+
+def is_queue_paused() -> bool:
+    try:
+        return get_pause_file().exists()
+    except OSError:
+        return False
+
+
+def meta_update(video_id: int, **fields: object) -> None:
+    if upsert_job_meta is None:
+        return
+    try:
+        upsert_job_meta(video_id, db_path=DB_PATH, **fields)
+    except Exception as exc:
+        log(f"meta_update failed for video {video_id}: {exc}")
+
+
+def get_job_meta(video_id: int) -> dict[str, object]:
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM studio_job_meta WHERE video_id=?", (video_id,)).fetchone()
+        return dict(row) if row is not None else {}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
+def notify_webhook_if_needed(video_id: int, event: str, payload: dict[str, object]) -> None:
+    meta = get_job_meta(video_id)
+    url = str(meta.get("webhook_url") or "").strip()
+    if not url or int(meta.get("webhook_notified") or 0) == 1:
+        return
+    body = json.dumps(
+        {
+            "event": event,
+            "video_id": video_id,
+            "timestamp": int(time.time()),
+            "data": payload,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read(256)
+        meta_update(video_id, webhook_notified=1)
+        log(f"video {video_id} webhook notified ({event}) -> {url}")
+    except Exception as exc:
+        log(f"video {video_id} webhook failed ({url}): {exc}")
 
 
 def get_primary_gpu_memory_mb() -> tuple[int, int] | None:
@@ -394,6 +484,7 @@ def get_primary_gpu_memory_mb() -> tuple[int, int] | None:
             errors="replace",
             check=False,
             timeout=8,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception:
         return None
@@ -699,6 +790,7 @@ def _ensure_clipped_reference_audio(
         encoding="utf-8",
         errors="replace",
         check=False,
+        creationflags=CREATE_NO_WINDOW,
     )
     if result.returncode == 0:
         return True
@@ -852,6 +944,7 @@ def maybe_restart_container(container_name: str, reason: str) -> None:
             errors="replace",
             check=False,
             timeout=180,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
         log(f"self-heal restart {container_name} failed: {exc}")
@@ -897,6 +990,7 @@ def maybe_start_index_tts2_adapter(reason: str) -> bool:
             cwd=str(INDEX_TTS_ADAPTER_SCRIPT.parent),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
         )
         _LAST_INDEX_TTS_START_AT = now
         log(f"self-heal started index-tts2 adapter ({reason})")
@@ -958,6 +1052,7 @@ def fetch_gen_video_activity_ages(force: bool = False) -> dict[str, float]:
             errors="replace",
             check=False,
             timeout=25,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
         log(f"gen-video activity check failed: {exc}")
@@ -965,7 +1060,7 @@ def fetch_gen_video_activity_ages(force: bool = False) -> dict[str, float]:
 
     blob = "\n".join(part for part in [(result.stdout or ""), (result.stderr or "")] if part)
     activity: dict[str, float] = {}
-    activity_tokens = ("avi write success", "av_transfer", "get_run_netg end", "preprocess_ end")
+    activity_tokens = ("avi write success", "av_transfer", "get_run_netg end", "preprocess_ end", "command:ffmpeg", "result info")
     now = time.time()
 
     for line in blob.splitlines():
@@ -985,6 +1080,221 @@ def fetch_gen_video_activity_ages(force: bool = False) -> dict[str, float]:
     _LAST_GEN_VIDEO_ACTIVITY = activity
     _LAST_GEN_VIDEO_ACTIVITY_FETCH_AT = now
     return dict(activity)
+
+
+_FRAME_IDX_RE = re.compile(r"current_idx\s*:\s*(\d+)")
+_VIDEO_AUDIO_INFO_RE = re.compile(r"video_info:\[([0-9.]+)/\d+/\d+/[0-9.]+\],\s*audio_info:\[([0-9.]+)\]")
+_PHASE_RANK = {
+    "queued": 0,
+    "tts_loading": 1,
+    "tts_synthesizing": 2,
+    "submitting": 3,
+    "face2face_rendering": 4,
+    "ffmpeg_muxing": 5,
+    "delivering": 6,
+    "success": 7,
+}
+
+
+def parse_gen_video_render_telemetry(
+    code: str,
+    estimated_total_frames: int = 0,
+    render_started_at: float | None = None,
+    log_text: str | None = None,
+) -> dict[str, object]:
+    """从 duix-avatar-gen-video 容器日志中提取某任务 UUID 的真实帧级渲染进度与健康状态。"""
+    code_lower = normalize_code(code).lower()
+    telemetry: dict[str, object] = {
+        "phase": "face2face_rendering",
+        "stage_label": "正在准备视频渲染...",
+        "rendered_frames": 0,
+        "total_frames": max(0, int(estimated_total_frames or 0)),
+        "render_fps": 0.0,
+        "eta_seconds": -1,
+        "progress_float": 25.0,
+        "heartbeat_at": 0.0,
+        "first_avi_ts": 0.0,
+        "container_error": "",
+        "recent_logs": [],
+    }
+    if not code_lower:
+        return telemetry
+
+    if log_text is None:
+        since_sec = 300
+        if render_started_at and render_started_at > 0:
+            since_sec = min(3600, max(300, int(time.time() - render_started_at) + 60))
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "logs",
+                    "--since",
+                    f"{since_sec}s",
+                    "--tail",
+                    "2500",
+                    GEN_VIDEO_CONTAINER_NAME,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            log_text = "\n".join(p for p in ((result.stdout or ""), (result.stderr or "")) if p)
+        except Exception as exc:
+            telemetry["recent_logs"] = [f"读取容器日志失败: {exc}"]
+            return telemetry
+
+    matched_lines: list[str] = []
+    seen_code = False
+    max_avi_frame = 0
+    max_queued_frame = 0
+    log_total_frames = 0
+    latest_ts = 0.0
+    first_avi_ts = 0.0
+    latest_avi_ts = 0.0
+    phase = "face2face_rendering"
+    stage_label = "正在初始化唇形渲染引擎..."
+    container_error = ""
+    has_feature_done = False
+
+    for line in log_text.splitlines():
+        if "/easy/query" in line:
+            continue
+        lowered = line.lower()
+        if code_lower not in lowered:
+            # 仅在当前任务 UUID 已经出现在日志之后，才捕获相邻的 CUDA OOM / 严重异常，避免串扰旧任务报错
+            if seen_code and ("out of memory" in lowered or "cuda error" in lowered):
+                container_error = line.strip()[-260:]
+            continue
+
+        seen_code = True
+        clean = line.strip()
+        matched_lines.append(clean[-220:])
+        ts = _parse_log_timestamp_seconds(clean)
+        if ts and ts > latest_ts:
+            latest_ts = ts
+
+        # 解析引擎打印的精确视频帧率与音频时长，拿到真实总帧数（兼容 25/30/60fps 底模）
+        info_match = _VIDEO_AUDIO_INFO_RE.search(clean)
+        if info_match:
+            try:
+                v_fps = float(info_match.group(1))
+                a_dur = float(info_match.group(2))
+                if v_fps > 0 and a_dur > 0:
+                    log_total_frames = max(1, int(round(v_fps * a_dur)))
+            except Exception:
+                pass
+
+        if "get_aud_feat1 success" in lowered or "init_wh_process end" in lowered:
+            has_feature_done = True
+
+        # 严格区分「输入帧预读取 av_transfer」与「真实 GPU 唇形渲染写入 avi write success」
+        idx_match = _FRAME_IDX_RE.search(clean)
+        if idx_match:
+            frame_idx = int(idx_match.group(1))
+            if "avi write success" in lowered:
+                if frame_idx > max_avi_frame:
+                    max_avi_frame = frame_idx
+                if first_avi_ts == 0.0 and ts:
+                    first_avi_ts = ts
+                if ts and ts > latest_avi_ts:
+                    latest_avi_ts = ts
+                phase = "face2face_rendering"
+                stage_label = f"唇形渲染中（已写出 {max_avi_frame} 帧）"
+            elif "av_transfer" in lowered:
+                if frame_idx > max_queued_frame:
+                    max_queued_frame = frame_idx
+
+        if "handler netg end" in lowered or "av_transfer success" in lowered:
+            phase = "ffmpeg_muxing"
+            stage_label = "唇形推理完毕，正在拼接视频轨..."
+        elif "command:ffmpeg" in lowered:
+            phase = "ffmpeg_muxing"
+            stage_label = "FFmpeg 正在封装高清成片（请耐心等待，勿重启）"
+        elif "任务最终合成结果" in clean:
+            phase = "delivering"
+            stage_label = "成片封装完成，正在校验并归档交付..."
+        elif any(tok in lowered for tok in ("traceback", "error:", "exception", "out of memory", "failed")):
+            if "loglevel warning" not in lowered:
+                container_error = clean[-260:]
+
+    total_frames = log_total_frames if log_total_frames > 0 else max(0, int(estimated_total_frames or 0))
+    if max_avi_frame > total_frames and total_frames > 0:
+        total_frames = max_avi_frame
+
+    # 用真实 AVI 渲染写帧时间窗口计算渲染速度，避免被前置特征提取时间拉偏 ETA
+    elapsed = 0.0
+    if first_avi_ts > 0 and latest_avi_ts > first_avi_ts:
+        elapsed = max(0.5, latest_avi_ts - first_avi_ts)
+    elif first_avi_ts > 0:
+        elapsed = max(1.0, time.time() - first_avi_ts)
+    elif render_started_at and render_started_at > 0 and max_avi_frame > 0:
+        elapsed = max(1.0, time.time() - render_started_at)
+
+    render_fps = round(max_avi_frame / elapsed, 2) if (max_avi_frame > 0 and elapsed > 0) else 0.0
+    eta_seconds = -1
+    if phase == "face2face_rendering" and total_frames > 0 and max_avi_frame > 0:
+        ratio = min(1.0, max_avi_frame / float(total_frames))
+        progress_float = round(28.0 + ratio * 62.0, 1)  # 28% -> 90%
+        if render_fps > 0.05:
+            remaining_frames = max(0, total_frames - max_avi_frame)
+            eta_seconds = int(remaining_frames / render_fps) + max(8, int((total_frames / 30.0) * 0.25))
+        stage_label = f"唇形渲染 {max_avi_frame}/{total_frames} 帧 ({ratio * 100:.1f}%)"
+    elif phase == "face2face_rendering" and max_queued_frame > 0:
+        q_ratio = min(1.0, max_queued_frame / float(total_frames)) if total_frames > 0 else 0.5
+        progress_float = round(26.0 + q_ratio * 2.0, 1)
+        stage_label = (
+            f"正在预处理底模与音画特征（已送入 {max_queued_frame}/{total_frames} 帧）..."
+            if total_frames > 0
+            else f"正在预处理底模与音画特征（已送入 {max_queued_frame} 帧）..."
+        )
+    elif phase == "face2face_rendering" and has_feature_done:
+        progress_float = 26.5
+        stage_label = "音视频特征提取完成，正在启动 GPU 唇形推理..."
+    elif phase == "ffmpeg_muxing":
+        progress_float = 93.0 if "FFmpeg" in stage_label else 91.5
+        eta_seconds = 20
+    elif phase == "delivering":
+        progress_float = 98.0
+        eta_seconds = 5
+    else:
+        progress_float = 25.5 if matched_lines else 25.0
+
+    telemetry.update(
+        {
+            "phase": phase,
+            "stage_label": stage_label,
+            "rendered_frames": max_avi_frame,
+            "total_frames": total_frames,
+            "render_fps": render_fps,
+            "eta_seconds": eta_seconds,
+            "progress_float": progress_float,
+            "heartbeat_at": latest_ts or (time.time() if matched_lines else 0.0),
+            "first_avi_ts": first_avi_ts,
+            "container_error": container_error,
+            "recent_logs": matched_lines[-15:],
+        }
+    )
+    return telemetry
+
+
+def update_video_if_status(video_id: int, expected_status: str, **fields: object) -> bool:
+    """条件更新 video 表，避免后台进度线程把已被用户中断的任务覆盖回 pending。"""
+    if not fields:
+        return False
+    conn = db()
+    try:
+        keys = list(fields.keys())
+        sql = f"UPDATE video SET {', '.join(f'{k}=?' for k in keys)} WHERE id=? AND status=?"
+        cur = conn.execute(sql, [fields[k] for k in keys] + [video_id, expected_status])
+        conn.commit()
+        return (cur.rowcount or 0) > 0
+    finally:
+        conn.close()
 
 
 def update_video(video_id: int, **fields: object) -> None:
@@ -1038,9 +1348,51 @@ def ensure_cancel_triggers(conn: sqlite3.Connection | None = None) -> None:
             conn.close()
 
 
+def is_studio_cancel_requested(video_id: int) -> bool:
+    conn = db()
+    try:
+        cur = conn.execute("SELECT 1 FROM studio_cancel_requests WHERE video_id = ?", [video_id])
+        if cur.fetchone() is not None:
+            return True
+        row = conn.execute("SELECT status FROM video WHERE id = ?", [video_id]).fetchone()
+        return row is not None and str(row["status"] or "").lower() == "cancelled"
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def abort_active_tts_if_needed() -> None:
+    try:
+        http_post_json(TTS_CANCEL_URL, {}, timeout=5)
+    except Exception:
+        pass
+
+
+def mark_video_cancelled(video_id: int, reason: str = "任务已被用户中断") -> None:
+    conn = db()
+    try:
+        row = conn.execute("SELECT 1 FROM video WHERE id = ?", [video_id]).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE video SET status='cancelled', message=?, code=NULL WHERE id=?",
+                (reason, video_id),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    meta_update(video_id, phase="cancelled", stage_label=reason, eta_seconds=-1)
+
+
 def is_video_cancelled(video_id: int, task_code: str | None = None) -> bool:
     conn = db()
     try:
+        try:
+            cur = conn.execute("SELECT 1 FROM studio_cancel_requests WHERE video_id = ?", [video_id])
+            if cur.fetchone() is not None:
+                return True
+        except sqlite3.OperationalError:
+            pass
         cur = conn.execute(
             "SELECT 1 FROM cancelled_video_tasks WHERE video_id = ?",
             [video_id],
@@ -1055,8 +1407,10 @@ def is_video_cancelled(video_id: int, task_code: str | None = None) -> bool:
             )
             if cur.fetchone() is not None:
                 return True
-        cur = conn.execute("SELECT 1 FROM video WHERE id = ?", [video_id])
-        if cur.fetchone() is None:
+        row = conn.execute("SELECT status FROM video WHERE id = ?", [video_id]).fetchone()
+        if row is None:
+            return True
+        if str(row["status"] or "").lower() == "cancelled":
             return True
         return False
     except sqlite3.OperationalError:
@@ -1083,6 +1437,10 @@ def clear_cancelled_video_task(video_id: int, task_code: str | None = None) -> N
                 "DELETE FROM cancelled_video_tasks WHERE video_id = ?",
                 [video_id],
             )
+        try:
+            conn.execute("DELETE FROM studio_cancel_requests WHERE video_id = ?", [video_id])
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -1119,6 +1477,7 @@ def force_restart_gen_video_container(reason: str, wait_ready: bool = True) -> b
             errors="replace",
             check=False,
             timeout=180,
+            creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
         log(f"[CANCEL] Force restart {container_name} failed: {exc}")
@@ -1144,10 +1503,23 @@ def force_restart_gen_video_container(reason: str, wait_ready: bool = True) -> b
 
 def process_cancelled_tasks() -> bool:
     conn = db()
+    rows: list[tuple[int, str, bool]] = []
     try:
-        rows = conn.execute("SELECT video_id, code, cancelled_at FROM cancelled_video_tasks").fetchall()
+        for r in conn.execute("SELECT video_id, code FROM cancelled_video_tasks").fetchall():
+            rows.append((int(r[0]), normalize_code(r[1]), False))
     except sqlite3.OperationalError:
-        return False
+        pass
+    try:
+        for r in conn.execute(
+            """
+            SELECT c.video_id, v.code
+            FROM studio_cancel_requests c
+            LEFT JOIN video v ON v.id = c.video_id
+            """
+        ).fetchall():
+            rows.append((int(r[0]), normalize_code(r[1]), True))
+    except sqlite3.OperationalError:
+        pass
     finally:
         conn.close()
 
@@ -1155,10 +1527,8 @@ def process_cancelled_tasks() -> bool:
         return False
 
     changed = False
-    for r in rows:
-        vid = int(r[0])
-        code = normalize_code(r[1])
-        log(f"[CANCEL] Found pending cancelled task record: video_id={vid}, code={code}")
+    for vid, code, is_studio_cancel in rows:
+        log(f"[CANCEL] Found pending cancelled task: video_id={vid}, code={code}, studio={is_studio_cancel}")
         if is_valid_task_code(code):
             try:
                 res = http_get_json(F2F_QUERY_URL.format(code=code), timeout=10)
@@ -1169,16 +1539,18 @@ def process_cancelled_tasks() -> bool:
                 task_status = None
 
             if (status_code == 10000 and task_status == 1) or status_code == 10001:
-                log(f"[CANCEL] Task {vid} (code={code}) is active in backend (status={task_status}, code={status_code}); terminating...")
+                log(f"[CANCEL] Task {vid} (code={code}) is active in backend; aborting container...")
                 force_restart_gen_video_container(f"daemon aborting cancelled task {vid} code={code}", wait_ready=True)
 
             try:
-                rel_result, out_file = final_mp4_for_code(code)
+                _, out_file = final_mp4_for_code(code)
                 if out_file.exists():
                     out_file.unlink(missing_ok=True)
             except Exception:
                 pass
 
+        if is_studio_cancel:
+            mark_video_cancelled(vid, "任务已被用户中断")
         clear_cancelled_video_task(vid, code)
         changed = True
 
@@ -1186,6 +1558,11 @@ def process_cancelled_tasks() -> bool:
 
 
 def ensure_retry_triggers() -> None:
+    if init_studio_schema is not None:
+        try:
+            init_studio_schema(DB_PATH)
+        except Exception as exc:
+            log(f"init_studio_schema warning: {exc}")
     conn = db()
     try:
         ensure_cancel_triggers(conn)
@@ -1216,6 +1593,8 @@ def ensure_retry_triggers() -> None:
             WHEN NEW.status='failed'
               AND COALESCE(NEW.progress, 0)=0
               AND COALESCE(trim(NEW.file_path), '')=''
+              AND instr(COALESCE(NEW.message, ''), '[已达重试上限]') = 0
+              AND instr(COALESCE(NEW.message, ''), '[不可重试]') = 0
               AND NOT (
                     OLD.status='pending'
                     AND COALESCE(trim(OLD.code), '') <> ''
@@ -1241,6 +1620,8 @@ def ensure_retry_triggers() -> None:
             WHEN NEW.status='failed'
               AND COALESCE(NEW.progress, 0)=0
               AND COALESCE(trim(NEW.file_path), '')=''
+              AND instr(COALESCE(NEW.message, ''), '[已达重试上限]') = 0
+              AND instr(COALESCE(NEW.message, ''), '[不可重试]') = 0
               AND ({retryable_message_sql})
             BEGIN
                 UPDATE video
@@ -1312,6 +1693,7 @@ def get_duration_seconds(video_path: Path) -> float | None:
         encoding="utf-8",
         errors="replace",
         check=False,
+        creationflags=CREATE_NO_WINDOW,
     )
     if result.returncode != 0:
         return None
@@ -1326,24 +1708,93 @@ def final_mp4_for_code(code: str) -> tuple[str, Path]:
     return rel, OUTPUT_ROOT / f"{code}-r.mp4"
 
 
-def deliver_video_copy(video_id: int, video_name: object, code: str, source: Path) -> Path | None:
-    """Copy a completed backend video to the user's stable delivery folder.
+def _resolve_category_subfolder_name(video_id: int) -> str:
+    conn = db()
+    try:
+        row = conn.execute(
+            """
+            SELECT c.name
+            FROM studio_job_meta m
+            JOIN studio_categories c ON c.id = m.category_id
+            WHERE m.video_id = ?
+            """,
+            (video_id,),
+        ).fetchone()
+        if row and row["name"]:
+            cleaned = re.sub(r'[<>:"/\\|?*]', "_", str(row["name"]).strip()).strip(" .")
+            return cleaned[:40]
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+    return ""
 
-    The backend keeps using D:/duix_avatar_data for its mounted working data;
-    this copy is the user-facing output and does not change the DB path expected
-    by the HeyGem client.
-    """
+
+def deliver_video_copy(video_id: int, video_name: object, code: str, source: Path) -> Path | None:
+    """Copy a completed backend video to the user's stable delivery folder (with optional category subfolder)."""
     if not source.exists() or source.stat().st_size <= 0:
         return None
     name = str(video_name or f"video_{video_id}").strip() or f"video_{video_id}"
     name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")[:80] or f"video_{video_id}"
     short_code = (str(code or "")[:8] or "result")
-    DELIVERY_ROOT.mkdir(parents=True, exist_ok=True)
-    target = DELIVERY_ROOT / f"{video_id:04d}_{name}_{short_code}.mp4"
+    cat_folder = _resolve_category_subfolder_name(video_id)
+    dest_dir = (DELIVERY_ROOT / cat_folder) if cat_folder else DELIVERY_ROOT
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / f"{video_id:04d}_{name}_{short_code}.mp4"
     if target.resolve() != source.resolve():
         if not target.exists() or target.stat().st_size != source.stat().st_size:
             shutil.copy2(source, target)
+    meta_update(video_id, delivered_path=str(target))
     return target
+
+
+def _finalize_video_success(
+    video_id: int,
+    video_name: object,
+    code: str,
+    rel_result: str,
+    video_file: Path,
+    message: str,
+    duration: float | None = None,
+    stage_label: str = "合成并交付完成",
+) -> Path | None:
+    """统一成片完成与文件自愈恢复收尾：归档交付、更新 video 与 studio_job_meta、并触发 job.completed Webhook。"""
+    if duration is None:
+        duration = get_duration_seconds(video_file)
+    delivered = deliver_video_copy(video_id, video_name, code, video_file)
+    if delivered:
+        log(f"Delivered video {video_id} -> {delivered}")
+    update_video(
+        video_id,
+        status="success",
+        message=message,
+        file_path=rel_result,
+        progress=100,
+        duration=duration,
+    )
+    meta_update(
+        video_id,
+        phase="success",
+        stage_label=stage_label,
+        progress_float=100.0,
+        eta_seconds=0,
+        delivered_path=str(delivered) if delivered else "",
+        error_code="",
+        error_detail="",
+        heartbeat_at=time.time(),
+    )
+    notify_webhook_if_needed(
+        video_id,
+        "job.completed",
+        {
+            "status": "success",
+            "name": video_name,
+            "file_path": rel_result,
+            "delivered_path": str(delivered) if delivered else "",
+            "duration": duration,
+        },
+    )
+    return delivered
 
 
 def fetch_row(sql: str, params: tuple = ()) -> sqlite3.Row | None:
@@ -1363,13 +1814,26 @@ def fetch_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 
 
 def fetch_next_waiting() -> sqlite3.Row | None:
-    # The desktop client may submit a newly-created row itself. Give it a short
-    # window first so the client and queue runner do not submit the same job.
+    # Studio 提交的任务可直接执行；旧版 Electron 客户端新建任务仍保留 8 秒避让窗口防止并发抢单。
     cutoff_ms = int(time.time() * 1000) - CLIENT_SUBMIT_GRACE_SECONDS * 1000
-    return fetch_row(
-        "SELECT * FROM video WHERE status='waiting' AND created_at<=? ORDER BY id ASC LIMIT 1",
-        (cutoff_ms,),
-    )
+    try:
+        return fetch_row(
+            """
+            SELECT v.*
+            FROM video v
+            LEFT JOIN studio_job_meta m ON m.video_id = v.id
+            WHERE v.status='waiting'
+              AND (m.video_id IS NOT NULL OR v.created_at <= ?)
+            ORDER BY v.id ASC
+            LIMIT 1
+            """,
+            (cutoff_ms,),
+        )
+    except sqlite3.OperationalError:
+        return fetch_row(
+            "SELECT * FROM video WHERE status='waiting' AND created_at<=? ORDER BY id ASC LIMIT 1",
+            (cutoff_ms,),
+        )
 
 
 def fetch_model(model_id: int) -> sqlite3.Row:
@@ -1508,7 +1972,7 @@ def find_matching_active_backend_code(audio_name: str, model_video_path: str) ->
         result = subprocess.run(
             ["docker", "logs", "--since", "90s", "--tail", "5000", GEN_VIDEO_CONTAINER_NAME],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            check=False, timeout=25,
+            check=False, timeout=25, creationflags=CREATE_NO_WINDOW,
         )
     except Exception as exc:
         log(f"active submission discovery failed: {exc}")
@@ -1577,21 +2041,52 @@ def maybe_log_backend_busy_wait() -> None:
     log(f"backend busy lock active, skip submit for {remaining}s")
 
 
+def _resolve_max_retries(meta: dict[str, object]) -> int:
+    raw = meta.get("max_retries")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_MAX_RETRIES
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RETRIES
+
+
 def reset_stuck_rows() -> None:
     process_cancelled_tasks()
     retryable_failed = fetch_all("SELECT id, message FROM video WHERE status='failed'")
     for row in retryable_failed:
-        if is_retryable_failure_message(row["message"]):
+        vid = int(row["id"])
+        msg_str = str(row["message"] or "")
+        if "[已达重试上限]" in msg_str or "[不可重试]" in msg_str:
+            continue
+        if is_retryable_failure_message(msg_str):
+            meta = get_job_meta(vid)
+            retries = int(meta.get("retry_count") or 0)
+            max_retries = _resolve_max_retries(meta)
+            if retries >= max_retries:
+                final_msg = f"[已达重试上限] 自动重试 {retries}/{max_retries} 次仍失败：{msg_str[:180]}"
+                _fail_video_permanently(vid, "MAX_RETRIES_EXCEEDED", final_msg, msg_str)
+                continue
+            next_retry = retries + 1
+            meta_update(
+                vid,
+                retry_count=next_retry,
+                phase="queued",
+                stage_label=f"瞬时故障自动重试 ({next_retry}/{max_retries})",
+                progress_float=0.0,
+                rendered_frames=0,
+                eta_seconds=-1,
+            )
             update_video(
-                int(row["id"]),
+                vid,
                 status="waiting",
-                message="Auto-retry after transient failure",
+                message=f"瞬时故障自动重试 ({next_retry}/{max_retries})",
                 progress=0,
                 code=None,
                 param=None,
                 file_path=None,
             )
-            log(f"Recovered retryable failed -> waiting: {row['id']}")
+            log(f"Recovered retryable failed -> waiting: {vid} ({next_retry}/{max_retries})")
 
     now_ms = int(time.time() * 1000)
     invalid_cutoff_ms = now_ms - PENDING_WITHOUT_CODE_STUCK_SECONDS * 1000
@@ -1602,7 +2097,7 @@ def reset_stuck_rows() -> None:
         update_video(int(row["id"]), status="waiting", message=None, code=None, progress=0, file_path=None)
         log(f"Recovered draft -> waiting: {row['id']}")
 
-    pending_rows = fetch_all("SELECT id, code, created_at, param, message FROM video WHERE status='pending'")
+    pending_rows = fetch_all("SELECT id, name, code, created_at, param, message FROM video WHERE status='pending'")
     active_runner_no_code_id: int | None = None
     active_runner_no_code_started_ms = 0
 
@@ -1627,16 +2122,15 @@ def reset_stuck_rows() -> None:
             rel_result, abs_result = final_mp4_for_code(code)
             duration = get_duration_seconds(abs_result) if abs_result.exists() else None
             if abs_result.exists() and duration is not None and duration > 0:
-                delivered = deliver_video_copy(int(row["id"]), row["name"], code, abs_result)
-                if delivered:
-                    log(f"Delivered video {row['id']} -> {delivered}")
-                update_video(
+                _finalize_video_success(
                     int(row["id"]),
-                    status="success",
+                    row["name"],
+                    code,
+                    rel_result,
+                    abs_result,
                     message="Recovered from timeout by existing output file",
-                    file_path=rel_result,
-                    progress=100,
                     duration=duration,
+                    stage_label="检测到已有成片，自动恢复并交付完成",
                 )
                 log(f"Recovered timeout pending -> success by file: {row['id']} ({rel_result})")
             else:
@@ -1649,6 +2143,7 @@ def reset_stuck_rows() -> None:
                     progress=0,
                     file_path=None,
                 )
+                meta_update(int(row["id"]), phase="queued", stage_label="渲染超时，已自动重排队列", progress_float=0.0)
                 log(f"Recovered timeout pending -> waiting: {row['id']}")
             continue
 
@@ -1684,7 +2179,16 @@ def reset_stuck_rows() -> None:
                 continue
 
         message_lower = str(row["message"] or "").strip().lower()
-        if "preparing audio" in message_lower:
+        meta_phase = str(get_job_meta(int(row["id"])).get("phase") or "").lower()
+        is_tts_phase = (
+            "preparing audio" in message_lower
+            or "正在准备音频" in message_lower
+            or "正在合成" in message_lower
+            or "正在加载" in message_lower
+            or "语音" in message_lower
+            or meta_phase in ("tts_loading", "tts_synthesizing")
+        )
+        if is_tts_phase:
             preparing_audio_cutoff_ms = now_ms - PENDING_PREPARING_AUDIO_STUCK_SECONDS * 1000
             if pending_since_ms > preparing_audio_cutoff_ms:
                 continue
@@ -1697,6 +2201,7 @@ def reset_stuck_rows() -> None:
                 progress=0,
                 file_path=None,
             )
+            meta_update(int(row["id"]), phase="queued", stage_label="语音准备超时，已自动重排队列", progress_float=0.0)
             log(f"Recovered stuck pending(preparing audio timeout) -> waiting: {row['id']}")
             continue
 
@@ -1749,8 +2254,11 @@ def sync_pending_from_backend() -> bool:
         video_id = int(row["id"])
         code = normalize_code(row["code"])
         if is_video_cancelled(video_id, code):
+            studio_cancel = is_studio_cancel_requested(video_id)
             log(f"[CANCEL] video {video_id} code={code} in sync_pending is cancelled, aborting backend")
             force_restart_gen_video_container(f"cancelled pending video {video_id} code={code}", wait_ready=True)
+            if studio_cancel:
+                mark_video_cancelled(video_id, "任务已被用户中断")
             clear_cancelled_video_task(video_id, code)
             changed = True
             continue
@@ -1776,19 +2284,16 @@ def sync_pending_from_backend() -> bool:
         if status_code in (9999, 10002, 10003):
             fail_msg = msg or f"backend code {status_code}"
             if is_retryable_failure_message(fail_msg):
-                update_video(
-                    video_id,
-                    status="waiting",
-                    message="Auto-retry after transient backend failure",
-                    progress=0,
-                    code=None,
-                    param=None,
-                    file_path=None,
-                )
-                log(f"video {video_id} backend code {status_code} is retryable -> waiting")
+                maybe_recover_retryable_video_error(video_id, RuntimeError(fail_msg))
+                log(f"video {video_id} backend code {status_code} handled via retry policy")
             else:
-                update_video(video_id, status="failed", message=fail_msg, progress=0)
-                log(f"video {video_id} marked failed by backend code {status_code}")
+                _fail_video_permanently(
+                    video_id,
+                    f"BACKEND_{status_code}",
+                    f"数字人渲染引擎返回错误 ({status_code})：{fail_msg}",
+                    json.dumps(res, ensure_ascii=False),
+                )
+                log(f"video {video_id} marked failed permanently by backend code {status_code}")
             changed = True
             continue
 
@@ -1796,16 +2301,15 @@ def sync_pending_from_backend() -> bool:
             rel_result, out_file = final_mp4_for_code(code)
             duration = get_duration_seconds(out_file) if out_file.exists() else None
             if out_file.exists() and duration is not None and duration > 0:
-                delivered = deliver_video_copy(video_id, row["name"], code, out_file)
-                if delivered:
-                    log(f"Delivered video {video_id} -> {delivered}")
-                update_video(
+                _finalize_video_success(
                     video_id,
-                    status="success",
+                    row["name"],
+                    code,
+                    rel_result,
+                    out_file,
                     message="Recovered by output file while backend returned 10004",
-                    file_path=rel_result,
-                    progress=100,
                     duration=duration,
+                    stage_label="检测到成片已生成，自动恢复并交付完成",
                 )
                 log(f"video {video_id} recovered from backend 10004 by file -> {rel_result}")
                 changed = True
@@ -1837,6 +2341,7 @@ def sync_pending_from_backend() -> bool:
                     progress=0,
                     file_path=None,
                 )
+                meta_update(video_id, phase="queued", stage_label="后端任务记录丢失，已自动重排队列", progress_float=0.0)
                 log(f"video {video_id} moved back to waiting after backend 10004 grace period")
                 changed = True
             elif (row["message"] or "") != (msg or "backend code 10004"):
@@ -1850,16 +2355,15 @@ def sync_pending_from_backend() -> bool:
             if out_file.exists():
                 duration = get_duration_seconds(out_file)
                 if duration is not None and duration > 0:
-                    delivered = deliver_video_copy(video_id, row["name"], code, out_file)
-                    if delivered:
-                        log(f"Delivered video {video_id} -> {delivered}")
-                    update_video(
+                    _finalize_video_success(
                         video_id,
-                        status="success",
+                        row["name"],
+                        code,
+                        rel_result,
+                        out_file,
                         message=msg or "视频处理完成",
-                        file_path=rel_result,
-                        progress=100,
                         duration=duration,
+                        stage_label="合成并交付完成",
                     )
                     log(f"video {video_id} finalized from existing output -> {rel_result}")
                     changed = True
@@ -1891,6 +2395,7 @@ def sync_pending_from_backend() -> bool:
                         param=None,
                         file_path=None,
                     )
+                    meta_update(video_id, phase="queued", stage_label="渲染疑似卡住，已自动重排队列", progress_float=0.0)
                     log(f"video {video_id} recovered from render stall -> waiting")
                     changed = True
                     continue
@@ -1906,20 +2411,17 @@ def sync_pending_from_backend() -> bool:
             continue
 
         if status_code == 10000 and task_status == 2:
-            result = str(data.get("result") or "")
-            msg = str(data.get("msg") or "Task finished")
+            result = str(data.get("result") or "").strip() or f"/{code}-r.mp4"
+            msg = str(data.get("msg") or "视频合成完成")
             video_file = OUTPUT_ROOT / result.lstrip("/\\")
-            duration = get_duration_seconds(video_file)
-            delivered = deliver_video_copy(video_id, row["name"], code, video_file)
-            if delivered:
-                log(f"Delivered video {video_id} -> {delivered}")
-            update_video(
+            _finalize_video_success(
                 video_id,
-                status="success",
+                row["name"],
+                code,
+                result,
+                video_file,
                 message=msg,
-                file_path=result,
-                progress=int(data.get("progress") or 100),
-                duration=duration,
+                stage_label="合成并交付完成",
             )
             log(f"video {video_id} success -> {result}")
             changed = True
@@ -1928,18 +2430,10 @@ def sync_pending_from_backend() -> bool:
         if status_code == 10000 and task_status == 3:
             fail_msg = msg or "backend status=3"
             if is_retryable_failure_message(fail_msg):
-                update_video(
-                    video_id,
-                    status="waiting",
-                    message="Auto-retry after transient backend failure",
-                    progress=0,
-                    code=None,
-                    param=None,
-                    file_path=None,
-                )
-                log(f"video {video_id} backend status 3 is retryable -> waiting")
+                maybe_recover_retryable_video_error(video_id, RuntimeError(fail_msg))
+                log(f"video {video_id} backend status 3 handled via retry policy")
             else:
-                update_video(video_id, status="failed", message=fail_msg, progress=0)
+                _fail_video_permanently(video_id, "RENDER_FAILED", f"数字人渲染失败：{fail_msg}", json.dumps(data, ensure_ascii=False))
                 log(f"video {video_id} marked failed by backend status 3")
             changed = True
             continue
@@ -1973,18 +2467,57 @@ def sync_success_deliveries(limit: int = 10) -> None:
                     update_video(video_id, duration=duration)
 
 
+def _load_job_tts_params(video_id: int) -> dict[str, object]:
+    meta = get_job_meta(video_id)
+    raw = str(meta.get("tts_params_json") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fail_video_permanently(video_id: int, error_code: str, message: str, detail: str = "") -> None:
+    clean_msg = message if ("[不可重试]" in message or "[已达重试上限]" in message) else f"[不可重试] {message}"
+    update_video(
+        video_id,
+        status="failed",
+        message=clean_msg[:300],
+        progress=0,
+        code=None,
+    )
+    meta_update(
+        video_id,
+        phase="failed",
+        stage_label=clean_msg[:180],
+        progress_float=0.0,
+        eta_seconds=-1,
+        error_code=error_code,
+        error_detail=(detail or message)[:2000],
+    )
+    notify_webhook_if_needed(
+        video_id,
+        "job.failed",
+        {"status": "failed", "error_code": error_code, "message": clean_msg, "detail": (detail or message)[:1000]},
+    )
+
+
 def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
+    video_id = int(video["id"])
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     speaker = str(uuid.uuid4())
     tts_mode = get_tts_mode()
 
     if tts_mode == "index-tts2" and not is_index_tts2_ready(timeout=4):
+        meta_update(video_id, phase="tts_loading", stage_label="正在拉起本地 IndexTTS2 语音服务...", progress_float=2.0)
         maybe_start_index_tts2_adapter("preflight health check")
         if not is_index_tts2_ready(timeout=4):
             raise RuntimeError("index-tts2 adapter is not ready on 127.0.0.1:18180")
 
     selected_voice, reference_audio = pick_voice_for_tts(voice, tts_mode)
-    reference_audio = maybe_shorten_reference_audio(reference_audio, tts_mode, int(video["id"]))
+    reference_audio = maybe_shorten_reference_audio(reference_audio, tts_mode, video_id)
     reference_text = str(selected_voice["reference_audio_text"] or "")
 
     if tts_mode == "fish-speech":
@@ -2000,7 +2533,7 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
             total_mb, used_mb = gpu_mem
             free_mb = max(0, total_mb - used_mb)
             log(
-                f"video {video['id']} fish refs={len(ref_parts)} "
+                f"video {video_id} fish refs={len(ref_parts)} "
                 f"(target={target_count}, gpu_free={free_mb}MB/{total_mb}MB)"
             )
 
@@ -2014,11 +2547,127 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
 
     original_reference_audio = str(voice["asr_format_audio_url"] or "").replace("\\", "/")
     if reference_audio != original_reference_audio.replace("\\", "/"):
-        log(f"video {video['id']} mapped reference audio for {tts_mode}: {reference_audio}")
+        log(f"video {video_id} mapped reference audio for {tts_mode}: {reference_audio}")
     if not reference_audio_exists(reference_audio, tts_mode):
         raise FileNotFoundError(
-            f"video {video['id']} reference audio is missing for mode={tts_mode}: {reference_audio}"
+            f"参考音色文件缺失（mode={tts_mode}）：{reference_audio}。请在「模特与音色」页面检查该音色文件。"
         )
+
+    full_text = str(video["text_content"] or "").strip()
+    if not full_text:
+        raise ValueError("口播文案为空，无法生成语音。")
+
+    # IndexTTS2 模式：整段文案单次发给适配器（内部按句分段、只加载一次模型、不重复冷启动），同时实时轮询进度与中断信号
+    if tts_mode == "index-tts2":
+        tts_params = _load_job_tts_params(video_id)
+        payload: dict[str, object] = {
+            "speaker": speaker,
+            "format": "wav",
+            "text": full_text,
+            "reference_audio": reference_audio,
+            "reference_text": reference_text,
+            "tts_params": tts_params,
+        }
+        stop_watch = threading.Event()
+        tts_started_at = time.time() - 0.5
+
+        def _watch_tts() -> None:
+            while not stop_watch.is_set():
+                if is_video_cancelled(video_id):
+                    log(f"[CANCEL] video {video_id} cancel detected during IndexTTS2 synthesis, aborting adapter...")
+                    abort_active_tts_if_needed()
+                    return
+                try:
+                    st = http_get_json(TTS_STATUS_URL, timeout=2)
+                    if stop_watch.is_set() or is_video_cancelled(video_id):
+                        if is_video_cancelled(video_id):
+                            abort_active_tts_if_needed()
+                        return
+                    data = st.get("data") or {}
+                    tts_state = str(data.get("state") or "")
+                    updated_at = float(data.get("updated_at") or 0.0)
+                    # 仅采信本次任务启动后的真实运行状态，避免把上一条任务的 100% 残留状态错写进当前任务
+                    if tts_state in ("loading_model", "synthesizing", "postprocessing") and updated_at >= tts_started_at:
+                        tts_pct = int(data.get("progress") or 0)
+                        stage_msg = str(data.get("message") or "IndexTTS2 语音合成中...")
+                        overall = round(2.0 + min(100, max(0, tts_pct)) * 0.20, 1)  # 2% -> 22%
+                        phase_name = "tts_loading" if tts_state == "loading_model" else "tts_synthesizing"
+                        logs = data.get("recent_logs") or []
+                        if not stop_watch.is_set() and not is_video_cancelled(video_id):
+                            if update_video_if_status(video_id, "pending", message=stage_msg[:180], progress=int(overall)):
+                                meta_update(
+                                    video_id,
+                                    phase=phase_name,
+                                    stage_label=stage_msg,
+                                    progress_float=overall,
+                                    heartbeat_at=time.time(),
+                                    recent_logs_json=json.dumps(logs[-15:], ensure_ascii=False),
+                                )
+                except Exception:
+                    pass
+                stop_watch.wait(1.0)
+
+        watcher = threading.Thread(target=_watch_tts, daemon=True)
+        watcher.start()
+        try:
+            audio_bytes = b""
+            for attempt in range(1, TTS_MAX_RETRIES + 1):
+                if is_video_cancelled(video_id):
+                    abort_active_tts_if_needed()
+                    raise InterruptedError(f"video {video_id} cancelled by user")
+                try:
+                    log(
+                        f"video {video_id} IndexTTS2 single-batch invoke (chars={len(full_text)}, attempt={attempt}/{TTS_MAX_RETRIES})"
+                    )
+                    audio_bytes = http_post_binary(
+                        TTS_INVOKE_URL,
+                        payload,
+                        timeout=TTS_SINGLE_BATCH_TIMEOUT_SECONDS,
+                    )
+                    break
+                except urllib.error.HTTPError as http_exc:
+                    body_text = ""
+                    try:
+                        body_text = http_exc.read().decode("utf-8", errors="replace")[:400]
+                    except Exception:
+                        pass
+                    if http_exc.code == 499 or is_video_cancelled(video_id):
+                        raise InterruptedError(f"video {video_id} cancelled by user") from http_exc
+                    if http_exc.code == 400:
+                        raise ValueError(f"IndexTTS2 参数或音色错误 (HTTP 400): {body_text or http_exc}") from http_exc
+                    log(f"video {video_id} IndexTTS2 HTTP {http_exc.code} attempt {attempt}: {body_text}")
+                    if attempt >= 2:
+                        maybe_start_index_tts2_adapter("tts invoke http errors")
+                    if attempt >= TTS_MAX_RETRIES:
+                        raise RuntimeError(f"IndexTTS2 语音合成连续失败 (HTTP {http_exc.code}): {body_text}") from http_exc
+                    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                except Exception as exc:
+                    if is_video_cancelled(video_id):
+                        raise InterruptedError(f"video {video_id} cancelled by user") from exc
+                    log(f"video {video_id} IndexTTS2 invoke failed attempt {attempt}: {exc}")
+                    if attempt >= 2:
+                        maybe_start_index_tts2_adapter("tts invoke errors")
+                    if attempt >= TTS_MAX_RETRIES:
+                        raise RuntimeError(f"IndexTTS2 语音合成重试失败: {exc}") from exc
+                    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        finally:
+            stop_watch.set()
+            watcher.join(timeout=4)
+
+        filename = f"{speaker}.wav"
+        target_wav = OUTPUT_ROOT / filename
+        target_wav.write_bytes(audio_bytes)
+        meta_update(
+            video_id,
+            source_audio_path=str(target_wav),
+            phase="submitting",
+            stage_label="语音合成完成，准备提交数字人渲染...",
+            progress_float=23.0,
+            heartbeat_at=time.time(),
+        )
+        return filename
+
+    # Fish-Speech 兼容分段逻辑（保持原样）
     base_payload = {
         "speaker": speaker,
         "format": "wav",
@@ -2034,18 +2683,15 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
         "reference_audio": reference_audio,
         "reference_text": reference_text,
     }
-    text_chunks = split_tts_text_for_safety(video["text_content"] or "")
+    text_chunks = split_tts_text_for_safety(full_text)
     if len(text_chunks) > 1:
-        log(
-            f"video {video['id']} auto-split text: chars={len(str(video['text_content'] or ''))} "
-            f"-> chunks={len(text_chunks)}"
-        )
+        log(f"video {video_id} auto-split text: chars={len(full_text)} -> chunks={len(text_chunks)}")
 
     chunk_audios: list[bytes] = []
     for idx, chunk_text in enumerate(text_chunks, start=1):
-        if is_video_cancelled(int(video["id"])):
-            log(f"[CANCEL] video {video['id']} was cancelled during audio generation")
-            raise RuntimeError(f"video {video['id']} cancelled by user")
+        if is_video_cancelled(video_id):
+            log(f"[CANCEL] video {video_id} was cancelled during audio generation")
+            raise InterruptedError(f"video {video_id} cancelled by user")
         payload = dict(base_payload)
         payload["text"] = chunk_text
         if len(text_chunks) > 1:
@@ -2055,38 +2701,34 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
                 chunk_len = 100
             payload["chunk_length"] = min(chunk_len, 80)
 
+        meta_update(
+            video_id,
+            phase="tts_synthesizing",
+            stage_label=f"Fish-Speech 正在合成第 {idx}/{len(text_chunks)} 段语音...",
+            progress_float=round(2.0 + ((idx - 1) / max(1, len(text_chunks))) * 20.0, 1),
+            heartbeat_at=time.time(),
+        )
+
         for attempt in range(1, TTS_MAX_RETRIES + 1):
             try:
-                if len(text_chunks) > 1:
-                    log(
-                        f"video {video['id']} generating audio chunk {idx}/{len(text_chunks)} "
-                        f"(attempt {attempt}/{TTS_MAX_RETRIES})"
-                    )
-                else:
-                    log(f"video {video['id']} generating audio... (attempt {attempt}/{TTS_MAX_RETRIES})")
                 audio_bytes = http_post_binary(TTS_INVOKE_URL, payload, timeout=TTS_REQUEST_TIMEOUT_SECONDS)
                 chunk_audios.append(audio_bytes)
                 break
             except Exception as exc:
-                log(
-                    f"video {video['id']} audio generation failed "
-                    f"(chunk {idx}/{len(text_chunks)}) attempt {attempt}: {exc}"
-                )
-                if tts_mode == "fish-speech" and attempt >= 2:
+                log(f"video {video_id} fish audio failed (chunk {idx}/{len(text_chunks)}) attempt {attempt}: {exc}")
+                if attempt >= 2:
                     maybe_restart_container(TTS_CONTAINER_NAME, "tts invoke errors")
-                if tts_mode == "index-tts2" and attempt >= 2:
-                    maybe_start_index_tts2_adapter("tts invoke errors")
                 if attempt >= TTS_MAX_RETRIES:
                     raise RuntimeError(
-                        f"video {video['id']} audio generation failed after retries "
-                        f"(chunk {idx}/{len(text_chunks)}): {exc}"
+                        f"video {video_id} audio generation failed after retries (chunk {idx}/{len(text_chunks)}): {exc}"
                     ) from exc
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-    audio_bytes = merge_wav_payloads(chunk_audios, int(video["id"]))
-
+    audio_bytes = merge_wav_payloads(chunk_audios, video_id)
     filename = f"{speaker}.wav"
-    (OUTPUT_ROOT / filename).write_bytes(audio_bytes)
+    target_wav = OUTPUT_ROOT / filename
+    target_wav.write_bytes(audio_bytes)
+    meta_update(video_id, source_audio_path=str(target_wav), progress_float=23.0, heartbeat_at=time.time())
     return filename
 
 
@@ -2115,17 +2757,35 @@ def submit_video_task(audio_name: str, model_video_path: str) -> tuple[dict, dic
     raise RuntimeError("submit failed unexpectedly")
 
 
-def poll_until_done(video_id: int, code: str) -> tuple[bool, dict]:
+def poll_until_done(
+    video_id: int,
+    code: str,
+    estimated_total_frames: int = 0,
+    render_started_at: float | None = None,
+) -> tuple[bool, dict]:
     consecutive_query_errors = 0
+    consecutive_unknown_states = 0
+    started_at = render_started_at or time.time()
+    first_10004_at = 0.0
+    last_telemetry_at = 0.0
+    last_progress_float = 25.0
+    best_rendered_frames = 0
+    known_total_frames = max(0, int(estimated_total_frames or 0))
+    best_phase = "face2face_rendering"
+    last_active_hb = started_at
+
     while True:
         time.sleep(POLL_SECONDS)
 
         if is_video_cancelled(video_id, code):
+            studio_cancel = is_studio_cancel_requested(video_id)
             log(f"[CANCEL] video {video_id} (code={code}) was cancelled by user! Aborting render...")
             force_restart_gen_video_container(f"user cancelled video {video_id} code={code}", wait_ready=True)
+            if studio_cancel:
+                mark_video_cancelled(video_id, "任务已被用户中断")
             clear_cancelled_video_task(video_id, code)
             try:
-                rel_result, out_file = final_mp4_for_code(code)
+                _, out_file = final_mp4_for_code(code)
                 if out_file.exists():
                     out_file.unlink(missing_ok=True)
             except Exception:
@@ -2137,12 +2797,20 @@ def poll_until_done(video_id: int, code: str) -> tuple[bool, dict]:
             consecutive_query_errors = 0
         except Exception as exc:
             if is_video_cancelled(video_id, code):
-                log(f"[CANCEL] video {video_id} (code={code}) was cancelled by user during query retry")
+                studio_cancel = is_studio_cancel_requested(video_id)
+                log(f"[CANCEL] video {video_id} (code={code}) cancelled during query retry")
                 force_restart_gen_video_container(f"user cancelled video {video_id} code={code}", wait_ready=True)
+                if studio_cancel:
+                    mark_video_cancelled(video_id, "任务已被用户中断")
                 clear_cancelled_video_task(video_id, code)
                 return False, {"msg": "Task cancelled by user", "cancelled": True}
             consecutive_query_errors += 1
-            log(f"video {video_id} query network error: {exc}")
+            log(f"video {video_id} query network error ({consecutive_query_errors}/10): {exc}")
+            meta_update(
+                video_id,
+                stage_label=f"渲染引擎连接抖动，正在重连 ({consecutive_query_errors}/10)...",
+                error_detail=str(exc),
+            )
             if consecutive_query_errors >= 10:
                 maybe_restart_container(GEN_VIDEO_CONTAINER_NAME, "query errors")
                 consecutive_query_errors = 0
@@ -2151,67 +2819,261 @@ def poll_until_done(video_id: int, code: str) -> tuple[bool, dict]:
         status_code = int(res.get("code", -1))
         data = res.get("data") or {}
         task_status = data.get("status")
-        progress = int(data.get("progress") or 0)
+        backend_progress = int(data.get("progress") or 0)
         msg = str(data.get("msg") or res.get("msg") or "")
 
         if status_code in (9999, 10002, 10003):
             return False, {"msg": msg or f"backend code {status_code}"}
 
-        if status_code == 10000 and task_status == 1:
-            update_video(video_id, status="pending", message=msg, progress=progress)
+        # 修复原版死循环：显式处理 10004（任务不存在）
+        if status_code == 10004:
+            _, out_file = final_mp4_for_code(code)
+            if out_file.exists():
+                dur = get_duration_seconds(out_file)
+                if dur is not None and dur > 0:
+                    return True, {"result": f"/{code}-r.mp4", "msg": "检测到成片已生成，自动恢复完成", "progress": 100}
+
+            telemetry = parse_gen_video_render_telemetry(code, known_total_frames, started_at)
+            hb = float(telemetry.get("heartbeat_at") or 0.0)
+            if hb > 0 and (time.time() - hb) <= GEN_VIDEO_ACTIVITY_STALE_SECONDS:
+                first_10004_at = 0.0
+                last_active_hb = max(last_active_hb, hb)
+                tel_frames = int(telemetry.get("rendered_frames") or 0)
+                if tel_frames > best_rendered_frames:
+                    best_rendered_frames = tel_frames
+                tel_total = int(telemetry.get("total_frames") or 0)
+                if tel_total > known_total_frames:
+                    known_total_frames = tel_total
+                stage_lbl = str(telemetry.get("stage_label") or "渲染仍在进行中（后端状态暂未同步）")
+                meta_update(
+                    video_id,
+                    phase=str(telemetry.get("phase") or best_phase),
+                    stage_label=stage_lbl,
+                    rendered_frames=best_rendered_frames,
+                    total_frames=known_total_frames,
+                    render_fps=float(telemetry.get("render_fps") or 0.0),
+                    eta_seconds=int(telemetry.get("eta_seconds") or -1),
+                    progress_float=max(last_progress_float, float(telemetry.get("progress_float") or last_progress_float)),
+                    heartbeat_at=hb,
+                    recent_logs_json=json.dumps(telemetry.get("recent_logs") or [], ensure_ascii=False),
+                )
+                continue
+
+            if first_10004_at == 0.0:
+                first_10004_at = time.time()
+            elapsed_10004 = time.time() - first_10004_at
+            meta_update(
+                video_id,
+                stage_label=f"后端任务记录丢失 (10004)，等待确认 ({int(elapsed_10004)}s/{BACKEND_10004_GRACE_SECONDS}s)...",
+            )
+            if elapsed_10004 >= BACKEND_10004_GRACE_SECONDS:
+                return False, {"msg": "任务不存在 (backend 10004 timeout，可能容器已重启)"}
             continue
+
+        first_10004_at = 0.0
+
+        if status_code == 10000 and task_status == 1:
+            consecutive_unknown_states = 0
+            now_t = time.time()
+            if now_t - last_telemetry_at >= 3.0:
+                last_telemetry_at = now_t
+                telemetry = parse_gen_video_render_telemetry(code, known_total_frames, started_at)
+                tel_frames = int(telemetry.get("rendered_frames") or 0)
+                if tel_frames > best_rendered_frames:
+                    best_rendered_frames = tel_frames
+                tel_total = int(telemetry.get("total_frames") or 0)
+                if tel_total > known_total_frames:
+                    known_total_frames = tel_total
+                tel_phase = str(telemetry.get("phase") or "face2face_rendering")
+                if _PHASE_RANK.get(tel_phase, 0) >= _PHASE_RANK.get(best_phase, 0):
+                    best_phase = tel_phase
+                tel_hb = float(telemetry.get("heartbeat_at") or 0.0)
+                if tel_hb > last_active_hb:
+                    last_active_hb = tel_hb
+
+                # 后端 /easy/query 在封装完成前最多到 80%，结合真实帧级遥测保证进度单调平滑
+                tel_progress = float(telemetry.get("progress_float") or 25.0)
+                combined_pct = max(last_progress_float, tel_progress, float(backend_progress))
+                combined_pct = min(99.0, combined_pct)
+                last_progress_float = round(combined_pct, 1)
+                stage_lbl = str(telemetry.get("stage_label") or msg or "视频渲染中")
+
+                if update_video_if_status(video_id, "pending", message=stage_lbl[:180], progress=int(last_progress_float)):
+                    meta_update(
+                        video_id,
+                        phase=best_phase,
+                        stage_label=stage_lbl,
+                        rendered_frames=best_rendered_frames,
+                        total_frames=known_total_frames,
+                        render_fps=float(telemetry.get("render_fps") or 0.0),
+                        eta_seconds=int(telemetry.get("eta_seconds") or -1),
+                        progress_float=last_progress_float,
+                        heartbeat_at=last_active_hb,
+                        recent_logs_json=json.dumps(telemetry.get("recent_logs") or [], ensure_ascii=False),
+                    )
+                    if telemetry.get("container_error"):
+                        meta_update(video_id, error_detail=str(telemetry["container_error"]))
+
+                # 死锁/长时失活守卫：仅当连续超时且容器日志长期无新心跳时主动介入，避免假死永久挂起
+                render_age = now_t - started_at
+                hb_stale_sec = now_t - last_active_hb
+                if render_age >= BACKEND_PROGRESS_STALL_REQUEUE_SECONDS and hb_stale_sec >= GEN_VIDEO_ACTIVITY_STALE_SECONDS * 2:
+                    maybe_restart_container(GEN_VIDEO_CONTAINER_NAME, f"render stalled >{int(hb_stale_sec)}s code={code}")
+                    return False, {"msg": f"渲染进程超过 {int(hb_stale_sec)} 秒无日志心跳，疑似卡死，已触发容器恢复"}
+                if render_age >= PENDING_WITH_CODE_TIMEOUT_SECONDS and hb_stale_sec >= GEN_VIDEO_ACTIVITY_STALE_SECONDS:
+                    maybe_restart_container(GEN_VIDEO_CONTAINER_NAME, f"render timeout code={code}")
+                    return False, {"msg": f"视频渲染超时（>{PENDING_WITH_CODE_TIMEOUT_SECONDS}s 且无活跃日志）"}
+            else:
+                if float(backend_progress) > last_progress_float:
+                    last_progress_float = round(min(99.0, float(backend_progress)), 1)
+                    update_video_if_status(video_id, "pending", message=msg or "视频渲染中", progress=int(last_progress_float))
+            continue
+
         if status_code == 10000 and task_status == 2:
             if is_video_cancelled(video_id, code):
+                studio_cancel = is_studio_cancel_requested(video_id)
                 log(f"[CANCEL] video {video_id} was cancelled right before completion, discarding output")
+                if studio_cancel:
+                    mark_video_cancelled(video_id, "任务已被用户中断")
                 clear_cancelled_video_task(video_id, code)
                 return False, {"msg": "Task cancelled by user", "cancelled": True}
             return True, data
+
         if status_code == 10000 and task_status == 3:
-            return False, {"msg": msg or "backend status=3"}
+            telemetry = parse_gen_video_render_telemetry(code, known_total_frames, started_at)
+            err_hint = str(telemetry.get("container_error") or "")
+            combined_msg = f"{msg or 'backend status=3'}" + (f" | {err_hint}" if err_hint else "")
+            return False, {"msg": combined_msg}
+
+        # 防止未知状态码/task_status 引发静默死循环
+        consecutive_unknown_states += 1
+        log(f"video {video_id} unexpected query reply ({consecutive_unknown_states}/15): code={status_code} status={task_status} msg={msg}")
+        if consecutive_unknown_states >= 15:
+            return False, {"msg": f"渲染引擎返回异常状态 (code={status_code}, status={task_status}): {msg}"}
+
+
+def _estimate_total_frames(model_video_path: Path, audio_file: Path) -> int:
+    try:
+        fps = 25.0
+        audio_dur = 0.0
+        if probe_media_info is not None:
+            m_info = probe_media_info(model_video_path)
+            if m_info.get("fps") and float(m_info["fps"]) > 1.0:
+                fps = float(m_info["fps"])
+            a_info = probe_media_info(audio_file)
+            if a_info.get("duration") and float(a_info["duration"]) > 0:
+                audio_dur = float(a_info["duration"])
+        else:
+            d = get_duration_seconds(audio_file)
+            audio_dur = float(d or 0.0)
+        if audio_dur > 0:
+            # 实机验证：duix.avatar 按底模原始帧率（包括 60fps）完整渲染，不降帧
+            return max(1, int(round(audio_dur * fps)))
+    except Exception:
+        pass
+    return 0
 
 
 def run_one(video: sqlite3.Row) -> None:
     video_id = int(video["id"])
-    model = fetch_model(int(video["model_id"]))
-    voice_id = int(video["voice_id"] or model["voice_id"])
-    voice = fetch_voice(voice_id)
+    try:
+        model = fetch_model(int(video["model_id"]))
+    except Exception as exc:
+        _fail_video_permanently(video_id, "MODEL_NOT_FOUND", f"找不到指定的数字人模特 (id={video['model_id']})", str(exc))
+        return
+
+    model_video_rel = str(model["video_path"] or "").strip()
+    model_video_abs = OUTPUT_ROOT / model_video_rel.lstrip("/\\")
+    if not model_video_rel or not model_video_abs.exists():
+        _fail_video_permanently(
+            video_id,
+            "MODEL_VIDEO_MISSING",
+            f"数字人「{model['name']}」的底模视频文件缺失（{model_video_abs}），请前往「模特与音色」页面重新关联或上传底模视频。",
+        )
+        return
+
+    audio_path = str(video["audio_path"] or "").strip()
+    voice: sqlite3.Row | None = None
+    if not audio_path:
+        try:
+            voice_id = int(video["voice_id"] or model["voice_id"])
+            voice = fetch_voice(voice_id)
+        except Exception as exc:
+            _fail_video_permanently(video_id, "VOICE_NOT_FOUND", f"找不到可用音色配置：{exc}", str(exc))
+            return
+
     run_started_at_ms = int(time.time() * 1000)
     cleanup_other_runner_no_code_pending(video_id)
 
     update_video(
         video_id,
         status="pending",
-        message="Preparing audio",
+        message="正在准备音频...",
         file_path=None,
-        progress=0,
+        progress=1,
         code=None,
         param=json.dumps({"_run_started_at_ms": run_started_at_ms, "_queue_owner": QUEUE_OWNER}, ensure_ascii=False),
     )
+    meta_update(
+        video_id,
+        phase="tts_loading" if not audio_path else "submitting",
+        stage_label="正在准备音频..." if not audio_path else "正在校验已导入音频...",
+        progress_float=1.0 if not audio_path else 20.0,
+        rendered_frames=0,
+        total_frames=0,
+        eta_seconds=-1,
+        error_code="",
+        error_detail="",
+        heartbeat_at=time.time(),
+    )
 
     if is_video_cancelled(video_id):
-        log(f"[CANCEL] video {video_id} was cancelled before audio preparation, skipping")
+        if is_studio_cancel_requested(video_id):
+            mark_video_cancelled(video_id, "任务已被用户中断")
         clear_cancelled_video_task(video_id)
         return
 
-    audio_path = video["audio_path"]
     try:
         if audio_path:
-            audio_name = str(audio_path)
+            audio_name = Path(audio_path).name
+            target_audio = OUTPUT_ROOT / audio_name
+            if not target_audio.exists():
+                meta = get_job_meta(video_id)
+                src_audio = Path(str(meta.get("source_audio_path") or ""))
+                if src_audio.is_file():
+                    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_audio, target_audio)
+            if not target_audio.exists():
+                _fail_video_permanently(
+                    video_id,
+                    "AUDIO_FILE_MISSING",
+                    f"指定的驱动音频文件不存在：{target_audio}",
+                )
+                return
         else:
+            assert voice is not None
             audio_name = make_audio_for_video(video, voice)
+    except InterruptedError:
+        log(f"[CANCEL] video {video_id} cancelled cleanly during audio prep")
+        if is_studio_cancel_requested(video_id):
+            mark_video_cancelled(video_id, "任务在语音合成阶段被用户中断")
+        clear_cancelled_video_task(video_id)
+        return
+    except (FileNotFoundError, ValueError) as exc:
+        _fail_video_permanently(video_id, "AUDIO_PREP_ERROR", str(exc), str(exc))
+        return
     except Exception as exc:
         if is_video_cancelled(video_id):
-            log(f"[CANCEL] video {video_id} cancelled during audio prep: {exc}")
+            if is_studio_cancel_requested(video_id):
+                mark_video_cancelled(video_id, "任务在语音合成阶段被用户中断")
             clear_cancelled_video_task(video_id)
             return
         raise
 
     if is_video_cancelled(video_id):
         log(f"[CANCEL] video {video_id} was cancelled after audio prep, skipping submit")
-        try:
-            (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
-        except Exception:
-            pass
+        if is_studio_cancel_requested(video_id):
+            mark_video_cancelled(video_id, "任务已被用户中断")
         clear_cancelled_video_task(video_id)
         return
 
@@ -2219,28 +3081,35 @@ def run_one(video: sqlite3.Row) -> None:
         update_video(
             video_id,
             status="waiting",
-            message="已有任务在渲染，自动顺延重试",
+            message="已有任务在渲染，自动顺延排队",
             audio_path=audio_name,
             code=None,
             param=None,
             progress=0,
             file_path=None,
         )
+        meta_update(video_id, phase="queued", stage_label="已有任务在渲染，音频已就绪等待渲染槽位", progress_float=22.0)
         log(f"video {video_id} deferred before submit because another pending task is active")
         return
 
-    update_video(video_id, status="pending", message="Submitting task", audio_path=audio_name)
+    estimated_total_frames = _estimate_total_frames(model_video_abs, OUTPUT_ROOT / audio_name)
+    update_video(video_id, status="pending", message="正在提交至数字人渲染引擎...", audio_path=audio_name, progress=24)
+    meta_update(
+        video_id,
+        phase="submitting",
+        stage_label="正在提交至数字人渲染引擎 (8383)...",
+        total_frames=estimated_total_frames,
+        progress_float=24.0,
+        heartbeat_at=time.time(),
+    )
 
     if is_video_cancelled(video_id):
-        log(f"[CANCEL] video {video_id} was cancelled right before submit, skipping submit")
-        try:
-            (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
-        except Exception:
-            pass
+        if is_studio_cancel_requested(video_id):
+            mark_video_cancelled(video_id, "任务已被用户中断")
         clear_cancelled_video_task(video_id)
         return
 
-    submit_result, submit_param = submit_video_task(audio_name, str(model["video_path"]))
+    submit_result, submit_param = submit_video_task(audio_name, model_video_rel)
     submit_code = _coerce_int(submit_result.get("code"))
     submit_msg = str(submit_result.get("msg") or submit_result)
     submit_param_with_meta = dict(submit_param)
@@ -2249,11 +3118,12 @@ def run_one(video: sqlite3.Row) -> None:
 
     if submit_code != 10000:
         if is_video_cancelled(video_id):
-            log(f"[CANCEL] video {video_id} was cancelled during submit rejection")
+            if is_studio_cancel_requested(video_id):
+                mark_video_cancelled(video_id, "任务已被用户中断")
             clear_cancelled_video_task(video_id)
             return
         if is_busy_submit_response(submit_result) or is_retryable_failure_message(submit_msg):
-            active_code = find_matching_active_backend_code(audio_name, str(model["video_path"]))
+            active_code = find_matching_active_backend_code(audio_name, model_video_rel)
             if active_code:
                 recovered_param = dict(submit_param_with_meta)
                 recovered_param["code"] = active_code
@@ -2267,9 +3137,10 @@ def run_one(video: sqlite3.Row) -> None:
                     audio_path=audio_name,
                     code=active_code,
                     param=json.dumps(recovered_param, ensure_ascii=False),
-                    progress=0,
+                    progress=25,
                     file_path=None,
                 )
+                meta_update(video_id, phase="face2face_rendering", stage_label="已接管后台渲染任务", progress_float=25.0)
                 log(f"video {video_id} adopted active backend code={active_code}")
                 return
 
@@ -2277,80 +3148,71 @@ def run_one(video: sqlite3.Row) -> None:
             update_video(
                 video_id,
                 status="waiting",
-                message=f"后端忙碌，{cooldown}s后自动重试",
+                message=f"后端忙碌，{cooldown}s 后自动重试",
                 audio_path=audio_name,
                 code=None,
                 param=None,
                 progress=0,
                 file_path=None,
             )
+            meta_update(video_id, phase="queued", stage_label=f"渲染引擎忙碌，{cooldown}s 后自动重试")
             log(f"video {video_id} submit busy -> deferred retry ({submit_msg})")
             return
 
-        update_video(
-            video_id,
-            status="failed",
-            message=submit_msg,
-            audio_path=audio_name,
-            code=str(submit_param["code"]),
-            param=json.dumps(submit_param_with_meta, ensure_ascii=False),
-            progress=0,
-        )
-        raise RuntimeError(f"video {video_id} submit failed: {submit_result}")
+        _fail_video_permanently(video_id, "SUBMIT_REJECTED", f"渲染引擎拒绝任务：{submit_msg}", json.dumps(submit_result, ensure_ascii=False))
+        return
 
     clear_backend_busy_lock()
+    task_code = str(submit_param["code"])
+    render_started_at = time.time()
     update_video(
         video_id,
         status="pending",
-        message=json.dumps(submit_result, ensure_ascii=False),
+        message="已进入数字人唇形渲染...",
         audio_path=audio_name,
-        code=str(submit_param["code"]),
+        code=task_code,
         param=json.dumps(submit_param_with_meta, ensure_ascii=False),
-        progress=0,
+        progress=25,
     )
-    task_code = str(submit_param["code"])
-    log(f"video {video_id} submitted, code={task_code}")
+    meta_update(
+        video_id,
+        phase="face2face_rendering",
+        stage_label="已提交渲染引擎，等待首批帧输出...",
+        total_frames=estimated_total_frames,
+        progress_float=25.0,
+        heartbeat_at=render_started_at,
+    )
+    log(f"video {video_id} submitted, code={task_code}, est_frames={estimated_total_frames}")
 
-    ok, data = poll_until_done(video_id, task_code)
+    ok, data = poll_until_done(
+        video_id,
+        task_code,
+        estimated_total_frames=estimated_total_frames,
+        render_started_at=render_started_at,
+    )
     if not ok:
         if data.get("cancelled"):
             log(f"[CANCEL] video {video_id} aborted cleanly (task cancelled by user)")
-            try:
-                (OUTPUT_ROOT / audio_name).unlink(missing_ok=True)
-            except Exception:
-                pass
             return
         fail_msg = str(data.get("msg", "unknown error"))
         if is_retryable_failure_message(fail_msg):
-            update_video(
-                video_id,
-                status="waiting",
-                message="Auto-retry after transient backend failure",
-                progress=0,
-                code=None,
-                param=None,
-                file_path=None,
-            )
-            log(f"video {video_id} retryable backend failure -> waiting ({fail_msg})")
-            return
-        update_video(video_id, status="failed", message=fail_msg, progress=0)
-        raise RuntimeError(f"video {video_id} failed: {data}")
+            if maybe_recover_retryable_video_error(video_id, RuntimeError(fail_msg)):
+                return
+        _fail_video_permanently(video_id, "RENDER_FAILED", f"数字人渲染失败：{fail_msg}", json.dumps(data, ensure_ascii=False))
+        return
 
     result = str(data.get("result") or "")
-    msg = str(data.get("msg") or "Task finished")
-    progress = int(data.get("progress") or 100)
+    msg = str(data.get("msg") or "视频合成完成")
     video_file = OUTPUT_ROOT / result.lstrip("/\\")
-    duration = get_duration_seconds(video_file)
-    delivered = deliver_video_copy(video_id, video["name"], task_code, video_file)
-    if delivered:
-        log(f"Delivered video {video_id} -> {delivered}")
-    update_video(
+    meta_update(video_id, phase="delivering", stage_label="渲染完成，正在校验并归档成片...", progress_float=98.0)
+    _finalize_video_success(
         video_id,
-        status="success",
+        video["name"],
+        task_code,
+        result,
+        video_file,
         message=msg,
-        file_path=result,
-        progress=progress,
-        duration=duration,
+        stage_label="合成并交付完成",
     )
     log(f"video {video_id} success -> {result}")
 
@@ -2358,21 +3220,48 @@ def run_one(video: sqlite3.Row) -> None:
 def maybe_recover_retryable_video_error(video_id: int, exc: Exception) -> bool:
     if is_video_cancelled(video_id):
         log(f"[CANCEL] Task {video_id} was cancelled, skipping retry recovery")
+        if is_studio_cancel_requested(video_id):
+            mark_video_cancelled(video_id, "任务已被用户中断")
         clear_cancelled_video_task(video_id)
         return True
     msg = str(exc or "")
     if not is_retryable_failure_message(msg):
-        return False
+        _fail_video_permanently(video_id, "RUNTIME_ERROR", f"任务执行异常：{msg[:200]}", msg)
+        return True
+
+    meta = get_job_meta(video_id)
+    retries = int(meta.get("retry_count") or 0)
+    max_retries = _resolve_max_retries(meta)
+    if retries >= max_retries:
+        _fail_video_permanently(
+            video_id,
+            "MAX_RETRIES_EXCEEDED",
+            f"[已达重试上限] 自动重试 {retries}/{max_retries} 次后仍失败：{msg[:160]}",
+            msg,
+        )
+        return True
+
+    next_retry = retries + 1
+    meta_update(
+        video_id,
+        retry_count=next_retry,
+        phase="queued",
+        stage_label=f"遇到瞬时异常，正在准备第 {next_retry}/{max_retries} 次自动重试...",
+        progress_float=0.0,
+        rendered_frames=0,
+        eta_seconds=-1,
+        error_detail=msg[:1500],
+    )
     update_video(
         video_id,
         status="waiting",
-        message="Auto-retry after transient runtime failure",
+        message=f"瞬时异常自动重试 ({next_retry}/{max_retries}): {msg[:80]}",
         progress=0,
         code=None,
         param=None,
         file_path=None,
     )
-    log(f"video {video_id} runtime retryable error -> waiting ({msg})")
+    log(f"video {video_id} runtime retryable error -> waiting ({next_retry}/{max_retries}): {msg}")
     return True
 
 
@@ -2398,6 +3287,9 @@ def run_once() -> int:
     reset_stuck_rows()
     sync_pending_from_backend()
     sync_success_deliveries()
+    if is_queue_paused():
+        log("Queue is paused; skipping new task dequeue.")
+        return 0
     if backend_busy_wait_seconds() > 0:
         maybe_log_backend_busy_wait()
         return 0
@@ -2413,8 +3305,7 @@ def run_once() -> int:
     try:
         run_one(next_video)
     except Exception as exc:
-        if not maybe_recover_retryable_video_error(int(next_video["id"]), exc):
-            raise
+        maybe_recover_retryable_video_error(int(next_video["id"]), exc)
     return 0
 
 
@@ -2443,7 +3334,9 @@ def main() -> int:
                 reset_stuck_rows()
                 changed = sync_pending_from_backend()
                 sync_success_deliveries()
-                if backend_busy_wait_seconds() > 0:
+                if is_queue_paused():
+                    pass
+                elif backend_busy_wait_seconds() > 0:
                     maybe_log_backend_busy_wait()
                 elif not has_pending_with_code() and has_waiting():
                     next_video = fetch_next_waiting()
@@ -2452,10 +3345,8 @@ def main() -> int:
                             run_one(next_video)
                             changed = True
                         except Exception as exc:
-                            if maybe_recover_retryable_video_error(int(next_video["id"]), exc):
-                                changed = True
-                            else:
-                                raise
+                            maybe_recover_retryable_video_error(int(next_video["id"]), exc)
+                            changed = True
                 if not changed:
                     time.sleep(DAEMON_IDLE_SECONDS)
             except Exception as exc:

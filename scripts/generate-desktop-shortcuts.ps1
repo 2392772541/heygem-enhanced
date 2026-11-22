@@ -28,16 +28,16 @@ $shortcuts = @(
   @{
     SubDir   = "01-启动停止"
     Name     = "HeyGem-启动.lnk"
-    Target   = (Join-Path $launchersDir "Start-HeyGem.bat")
+    Target   = (Join-Path $projectRoot "Start-Studio.vbs")
     Icon     = (Join-Path $iconsDir "start.ico")
-    Desc     = "启动 HeyGem 完整服务 (Docker + 队列调度 + 客户端)"
+    Desc     = "无黑框启动 HeyGem Studio 一体化数字人工作台 (Web UI + IndexTTS2 + Docker + 队列)"
   },
   @{
     SubDir   = "01-启动停止"
     Name     = "HeyGem-停止.lnk"
-    Target   = (Join-Path $launchersDir "Stop-HeyGem.bat")
+    Target   = (Join-Path $projectRoot "Stop-Studio.vbs")
     Icon     = (Join-Path $iconsDir "stop.ico")
-    Desc     = "安全优雅停止 HeyGem 所有相关服务与容器"
+    Desc     = "无黑框安全优雅停止 HeyGem Studio 所有相关服务与容器"
   },
   # 02-队列控制
   @{

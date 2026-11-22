@@ -169,6 +169,7 @@ function Start-QueueDaemonInstance {
       -FilePath $queuePython `
       -ArgumentList @($queueScript, '--daemon') `
       -WorkingDirectory (Split-Path -Parent $queueScript) `
+      -WindowStyle Hidden `
       -RedirectStandardOutput $queueStdoutLog `
       -RedirectStandardError $queueStderrLog `
       -PassThru
@@ -231,14 +232,54 @@ function Get-RecentTts500Count {
   return $count
 }
 
+function Get-CurrentTtsMode {
+  if (Test-Path $modeFile) {
+    $m = (Get-Content $modeFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($m) {
+      $m = $m.Trim().ToLowerInvariant()
+      if ($m -in @('index-tts2', 'fish-speech')) { return $m }
+    }
+  }
+  return 'index-tts2'
+}
+
 function Maybe-RestartTtsOnBurst500 {
-  $recent500 = Get-RecentTts500Count
-  if ($recent500 -lt $recent500Threshold) {
+  $mode = Get-CurrentTtsMode
+  $elapsed = ((Get-Date) - $script:lastTtsRestartAt).TotalSeconds
+  if ($elapsed -lt $ttsRestartCooldownSeconds) {
     return
   }
 
-  $elapsed = ((Get-Date) - $script:lastTtsRestartAt).TotalSeconds
-  if ($elapsed -lt $ttsRestartCooldownSeconds) {
+  if ($mode -eq 'index-tts2') {
+    # 在 index-tts2 模式下仅巡检本地 18180 适配器健康状态，严禁误重启 fish-speech 容器
+    $healthy = $false
+    try {
+      $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:18180/healthz' -UseBasicParsing -TimeoutSec 4
+      if ($resp.StatusCode -eq 200) { $healthy = $true }
+    } catch {}
+    if (-not $healthy) {
+      $adapterScript = Join-Path $projectRoot 'adapter\heygem_index_tts2_adapter.py'
+      $adapterPidFile = Join-Path $projectRoot 'heygem-index-tts2.pid'
+      $adapterPy = [string]$env:HEYGEM_ADAPTER_PYTHON
+      if ($adapterPy) { $adapterPy = $adapterPy.Trim() }
+      if (-not $adapterPy -or -not (Test-Path $adapterPy)) {
+        $localVenv = Join-Path $projectRoot 'adapter\venv\Scripts\python.exe'
+        if (Test-Path $localVenv) { $adapterPy = $localVenv }
+        elseif (Test-Path 'D:\HeyGem\tts-story-f5\venv\Scripts\python.exe') { $adapterPy = 'D:\HeyGem\tts-story-f5\venv\Scripts\python.exe' }
+        else { $adapterPy = Get-QueuePython }
+      }
+      if (Test-Path $adapterScript) {
+        $p = Start-Process -FilePath $adapterPy -ArgumentList @($adapterScript) -WorkingDirectory (Split-Path -Parent $adapterScript) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'heygem-index-tts2.out.log') -RedirectStandardError (Join-Path $logDir 'heygem-index-tts2.err.log') -PassThru
+        if ($p) { Set-Content -Path $adapterPidFile -Value $p.Id -Encoding ASCII }
+        $script:lastTtsRestartAt = Get-Date
+        Write-GuardLog "self-healed local index-tts2 adapter on port 18180 (pid=$($p.Id))"
+      }
+    }
+    return
+  }
+
+  $recent500 = Get-RecentTts500Count
+  if ($recent500 -lt $recent500Threshold) {
     return
   }
 

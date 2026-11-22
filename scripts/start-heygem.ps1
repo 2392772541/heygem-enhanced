@@ -1,4 +1,9 @@
-﻿$ErrorActionPreference = 'Continue'
+﻿param(
+  [switch]$LegacyClient,
+  [switch]$NoBrowser
+)
+
+$ErrorActionPreference = 'Continue'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Split-Path -Parent $scriptDir
@@ -37,6 +42,12 @@ $queueStderrLog = Join-Path $logDir 'heygem-queue-daemon.err.log'
 $queueGuardScript = Join-Path $projectRoot 'core\heygem-queue-guard.ps1'
 $queueGuardPidFile = Join-Path $projectRoot 'heygem-queue-guard.pid'
 $queueGuardLog = Join-Path $logDir 'heygem-queue-guard.log'
+
+$studioPidFile = Join-Path $projectRoot 'heygem-studio.pid'
+$studioStdoutLog = Join-Path $logDir 'heygem-studio.out.log'
+$studioStderrLog = Join-Path $logDir 'heygem-studio.err.log'
+$studioPort = if ($env:HEYGEM_STUDIO_PORT) { $env:HEYGEM_STUDIO_PORT } else { '8390' }
+$studioUrl = "http://127.0.0.1:$studioPort"
 
 $allContainers = @(
   'duix-avatar-tts',
@@ -92,6 +103,11 @@ foreach ($path in @($queueGuardLog, $queueStdoutLog, $queueStderrLog, $adapterSt
   Trim-LogFile -Path $path -MaxBytes $logTrimMaxBytes -KeepBytes $logTrimKeepBytes
 }
 Set-Content -Path $logPath -Value '' -Encoding UTF8
+
+$cleanupScript = Join-Path $scriptDir 'cleanup_heygem_cache.py'
+if (Test-Path $cleanupScript) {
+  Start-Process -FilePath 'python' -ArgumentList $cleanupScript -WindowStyle Hidden -ErrorAction SilentlyContinue
+}
 
 function Write-Log {
   param([string]$Message)
@@ -322,6 +338,7 @@ function Start-IndexTtsAdapter {
     -FilePath $adapterPython `
     -ArgumentList @($adapterScript) `
     -WorkingDirectory $adapterWorkDir `
+    -WindowStyle Hidden `
     -RedirectStandardOutput $adapterStdoutLog `
     -RedirectStandardError $adapterStderrLog `
     -PassThru
@@ -424,7 +441,72 @@ function Start-QueueGuard {
   Set-Content -Path $queueGuardPidFile -Value $process.Id -Encoding ASCII
 }
 
+function Stop-StudioServer {
+  $pids = @()
+  if (Test-Path $studioPidFile) {
+    $pidValue = (Get-Content $studioPidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+    if ($pidValue -match '^\d+$') { $pids += [int]$pidValue }
+    Remove-Item $studioPidFile -Force -ErrorAction SilentlyContinue
+  }
+  $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -like '*studio.server*'
+  }
+  foreach ($process in $processes) { $pids += [int]$process.ProcessId }
+  foreach ($pidValue in ($pids | Sort-Object -Unique)) {
+    Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Test-StudioReady {
+  try {
+    $resp = Invoke-WebRequest -Uri "$studioUrl/api/v1/ping" -UseBasicParsing -TimeoutSec 3
+    return ($resp.StatusCode -eq 200)
+  } catch {
+    return $false
+  }
+}
+
+function Start-StudioServer {
+  if (Test-StudioReady) {
+    Write-Log "HeyGem Studio Web service is already running at $studioUrl"
+    return
+  }
+  Stop-StudioServer
+  $studioPython = Get-QueuePython
+  Set-Content -Path $studioStdoutLog -Value '' -Encoding UTF8
+  Set-Content -Path $studioStderrLog -Value '' -Encoding UTF8
+  $env:HEYGEM_STUDIO_PORT = $studioPort
+  $process = Start-Process `
+    -FilePath $studioPython `
+    -ArgumentList @('-m', 'studio.server') `
+    -WorkingDirectory $projectRoot `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $studioStdoutLog `
+    -RedirectStandardError $studioStderrLog `
+    -PassThru
+  Set-Content -Path $studioPidFile -Value $process.Id -Encoding ASCII
+
+  $deadline = (Get-Date).AddSeconds(25)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-StudioReady) {
+      Write-Log "HeyGem Studio Web service is ready at $studioUrl (PID=$($process.Id))"
+      return
+    }
+    Start-Sleep -Milliseconds 800
+  }
+  Write-Log "Warning: HeyGem Studio Web service did not respond in time; check $studioStderrLog"
+}
+
+
 # --- Main execution flow ---
+
+Write-Log 'Starting HeyGem Studio Web UI & Automation API (fast boot)...'
+Start-StudioServer
+if (-not $NoBrowser) {
+  Write-Log "Opening unified HeyGem Studio in browser: $studioUrl"
+  Start-Process $studioUrl | Out-Null
+}
+
 $dockerDesktop = Resolve-DockerDesktop
 $clientExe = Resolve-ClientExe
 
@@ -441,6 +523,16 @@ if ($selectedMode -eq 'index-tts2' -and -not (Test-IndexTtsAvailable)) {
 Write-Log ("Selected TTS mode: {0}" -f $selectedMode)
 Write-Log ("Queue mode file: {0}" -f $modeFile)
 Write-Log ("Queue Python: {0}" -f (Get-QueuePython))
+
+if ($selectedMode -eq 'index-tts2') {
+  Write-Log 'Pre-starting local IndexTTS2 compatibility service (independent of Docker cold boot)...'
+  try {
+    Start-IndexTtsAdapter
+    Write-Log 'IndexTTS2 compatibility service is ready.'
+  } catch {
+    Write-Log ("Warning: pre-start IndexTTS2 failed: {0}" -f $_.Exception.Message)
+  }
+}
 
 Write-Log 'Checking Docker readiness...'
 if (-not (Test-DockerReady)) {
@@ -490,9 +582,11 @@ if ($selectedMode -eq 'index-tts2') {
     throw 'HeyGem video containers did not reach running state in time.'
   }
 
-  Write-Log 'Starting local IndexTTS2 compatibility service...'
-  Start-IndexTtsAdapter
-  Write-Log 'IndexTTS2 compatibility service is ready.'
+  if (-not (Wait-HttpReady -TimeoutSeconds 5)) {
+    Write-Log 'Starting local IndexTTS2 compatibility service...'
+    Start-IndexTtsAdapter
+    Write-Log 'IndexTTS2 compatibility service is ready.'
+  }
 } else {
   Stop-IndexTtsAdapter
   if (-not (Wait-ContainersReady -Names $allContainers)) {
@@ -510,11 +604,15 @@ Write-Log 'Starting queue guard daemon...'
 Start-QueueGuard
 Write-Log 'Queue guard is running.'
 
-if (Test-Path $clientExe) {
-  Write-Log 'Launching HeyGem client...'
-  Start-Process -FilePath $clientExe | Out-Null
-} else {
-  Write-Log "HeyGem client executable not found at $clientExe (You can start it manually when installed)."
+Start-StudioServer
+
+if ($LegacyClient) {
+  if (Test-Path $clientExe) {
+    Write-Log 'Launching legacy Duix.Avatar Electron client...'
+    Start-Process -FilePath $clientExe | Out-Null
+  } else {
+    Write-Log "Legacy client executable not found at $clientExe"
+  }
 }
 
-Write-Log 'Done. HeyGem-Enhanced environment is fully initialized.'
+Write-Log 'Done. HeyGem-Enhanced Studio environment is fully initialized.'

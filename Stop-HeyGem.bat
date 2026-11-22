@@ -1,3 +1,3 @@
 @echo off
-setlocal
-call "%~dp0launchers\Stop-HeyGem.bat"
+wscript.exe "%~dp0Stop-Studio.vbs"
+exit /b 0
