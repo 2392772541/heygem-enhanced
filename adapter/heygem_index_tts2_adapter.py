@@ -49,6 +49,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "index_tts_max_text_tokens_per_segment": 120,
     "index_tts_device": "auto",
     "index_tts_default_prompt": "",
+    "index_tts_override_request_prompt": False,
+    "index_tts_cfg_path": "",
     "index_tts_chunk_size": 180,
     "index_tts_interval_silence": 200,
     "index_tts_speed": 1.0,
@@ -223,18 +225,42 @@ def _load_config() -> dict[str, Any]:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
                 raw = json.load(fh)
-            if isinstance(raw, dict):
-                merged.update(raw)
         except Exception as exc:
             logger.warning("Failed to read %s: %s", CONFIG_PATH, exc)
+            raise ValueError(f"配置文件损坏或无法解析（禁止静默回退官方原版）: {CONFIG_PATH}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(f"配置文件格式无效，顶层必须为 JSON 对象（禁止静默回退官方原版）: {CONFIG_PATH}")
+        merged.update(raw)
     return merged
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return default
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in {"1", "true", "yes", "on"}:
+            return True
+        if low in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+    return bool(value)
 
 
 def _save_config(patch: dict[str, Any]) -> dict[str, Any]:
     current = _load_config()
     for key, value in patch.items():
         if key in DEFAULT_CONFIG:
-            current[key] = value
+            if key == "index_tts_override_request_prompt":
+                current[key] = _coerce_bool(value, False)
+            else:
+                current[key] = value
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
     with open(tmp_path, "w", encoding="utf-8") as fh:
@@ -315,6 +341,12 @@ def _resolve_audio_path(raw_path: str) -> Path:
         if candidate.is_absolute():
             candidates.append(candidate)
         else:
+            candidates.append((APP_ROOT / candidate).resolve())
+            candidates.append((PROJECT_ROOT / candidate).resolve())
+            if ENGINE_ROOT is not None:
+                story_root = ENGINE_ROOT.parent.parent
+                candidates.append((story_root / candidate).resolve())
+                candidates.append((story_root / "data" / "voice_prompts" / candidate).resolve())
             candidates.append((Path.cwd() / candidate).resolve())
             candidates.append((SHARED_ROOT / piece.lstrip("/")).resolve())
 
@@ -327,6 +359,102 @@ def _resolve_audio_path(raw_path: str) -> Path:
 
     checked = "\n".join(str(path) for path in _unique_paths(candidates))
     raise FileNotFoundError(f"找不到参考音频 '{raw_path}'，已检查路径:\n{checked}")
+
+
+def _is_prompt_override_enabled(config: dict[str, Any]) -> bool:
+    return _coerce_bool(config.get("index_tts_override_request_prompt"), False)
+
+
+def _extract_respect_request_prompt(payload: dict[str, Any]) -> bool:
+    tts_params = payload.get("tts_params")
+    if isinstance(tts_params, dict) and "respect_request_prompt" in tts_params and tts_params["respect_request_prompt"] is not None:
+        return _coerce_bool(tts_params["respect_request_prompt"], False)
+    if "respect_request_prompt" in payload and payload["respect_request_prompt"] is not None:
+        return _coerce_bool(payload["respect_request_prompt"], False)
+    return False
+
+
+def _resolve_personal_default_prompt(raw_path: Any) -> Path:
+    """严格校验个人模式默认参考音文件存在，严禁静默回退到旧数字人参考音。"""
+    normalized = _normalize_path_string(raw_path)
+    if not normalized:
+        raise FileNotFoundError(
+            "个人专属声音模式已开启参考音锁定，但未配置 index_tts_default_prompt（禁止静默回退请求传入的旧参考音）。"
+        )
+    candidate = Path(normalized)
+    checked: list[Path] = []
+    if candidate.is_absolute():
+        checked.append(candidate)
+    else:
+        checked.append((APP_ROOT / candidate).resolve())
+        checked.append((PROJECT_ROOT / candidate).resolve())
+        if ENGINE_ROOT is not None:
+            story_root = ENGINE_ROOT.parent.parent
+            checked.append((story_root / candidate).resolve())
+            checked.append((story_root / "data" / "voice_prompts" / candidate).resolve())
+        checked.append((Path.cwd() / candidate).resolve())
+    for resolved in _unique_paths(checked):
+        if resolved.is_file():
+            return resolved.resolve()
+    checked_str = ", ".join(str(path) for path in _unique_paths(checked))
+    raise FileNotFoundError(
+        f"个人专属默认参考音不存在或不是有效文件（禁止静默回退请求传入的旧参考音）: '{raw_path}' (已检查: {checked_str})"
+    )
+
+
+def _inspect_prompt_override_status(config: dict[str, Any], voice_mode: str) -> tuple[bool, bool, str, bool, str]:
+    """检查个人模式参考音锁定状态与默认个人参考音完整性，供 /healthz 输出。"""
+    override_enabled = _is_prompt_override_enabled(config)
+    prompt_override_active = (voice_mode == "personal") and override_enabled
+    raw_default = config.get("index_tts_default_prompt")
+    try:
+        default_str = _normalize_path_string(raw_default)
+    except Exception as exc:
+        return override_enabled, prompt_override_active, str(raw_default or ""), (not prompt_override_active), str(exc) if prompt_override_active else ""
+
+    if prompt_override_active:
+        try:
+            resolved = _resolve_personal_default_prompt(default_str)
+            return override_enabled, True, str(resolved).replace("\\", "/"), True, ""
+        except Exception as exc:
+            return override_enabled, True, default_str, False, str(exc)
+
+    return override_enabled, False, default_str, True, ""
+
+
+def _resolve_invoke_prompt(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+    voice_mode: str,
+) -> tuple[Path, bool, str]:
+    """
+    解析 /v1/invoke 实际使用的参考音路径，返回 (effective_prompt, prompt_overridden, requested_raw)。
+    - 个人模式且开启 index_tts_override_request_prompt 且未显式传 respect_request_prompt=True：
+      强制使用个人默认参考音，覆盖 HeyGem / HeyGem-Enhanced 传入的旧数字人 origin_audio；
+      若个人参考音缺失直接抛 FileNotFoundError（HTTP 400），严禁回退旧音频。
+    - 官方原版模式或单次显式 respect_request_prompt=True：完全尊重请求传入的 reference_audio。
+    """
+    requested_raw = _normalize_path_string(payload.get("reference_audio"))
+    default_raw = _normalize_path_string(config.get("index_tts_default_prompt"))
+    override_enabled = _is_prompt_override_enabled(config)
+    respect_request = _extract_respect_request_prompt(payload)
+
+    if voice_mode == "personal" and override_enabled and not respect_request:
+        personal_prompt = _resolve_personal_default_prompt(default_raw)
+        prompt_overridden = False
+        if requested_raw:
+            try:
+                req_resolved = _resolve_audio_path(requested_raw)
+                prompt_overridden = req_resolved.resolve() != personal_prompt.resolve()
+            except Exception:
+                prompt_overridden = True
+        return personal_prompt, prompt_overridden, requested_raw
+
+    if respect_request and requested_raw:
+        return _resolve_audio_path(requested_raw), False, requested_raw
+
+    effective_raw = requested_raw or default_raw
+    return _resolve_audio_path(effective_raw), False, requested_raw
 
 
 def _timestamp_from_name(name: str) -> str:
@@ -455,6 +583,74 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return chunks or [normalized]
 
 
+def _extract_yaml_scalar(yaml_path: Path, key: str) -> str:
+    """纯标准库读取 YAML 顶层标量，用于校验自定义配置文件中的 gpt_checkpoint。"""
+    text = yaml_path.read_text(encoding="utf-8-sig")
+    prefix = f"{key}:"
+    for raw_line in text.splitlines():
+        if not raw_line or raw_line[0].isspace():
+            continue
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefix):
+            val = stripped[len(prefix) :].strip()
+            if val and val[0] in ("'", '"'):
+                quote = val[0]
+                end_idx = val.find(quote, 1)
+                if end_idx > 0:
+                    return val[1:end_idx].strip()
+            if "#" in val:
+                val = val.split("#", 1)[0].strip()
+            return val.strip("'\"")
+    return ""
+
+
+def _resolve_and_validate_cfg_path(model_version: str, raw_custom_cfg: str) -> tuple[str, str]:
+    """根据模型版本解析并严格校验 cfg_path 与内部 gpt_checkpoint，严禁静默回退官方原版。"""
+    if ENGINE_ROOT is None:
+        return "", "base"
+    checkpoint_dir = ENGINE_ROOT / ("checkpoints_2_5" if model_version == "IndexTTS-2.5" else "checkpoints")
+    default_cfg = (checkpoint_dir / "config.yaml").resolve()
+    custom_cfg = (raw_custom_cfg or "").strip()
+
+    if custom_cfg and model_version == "IndexTTS-2":
+        custom_path = Path(custom_cfg)
+        if not custom_path.is_file():
+            raise FileNotFoundError(
+                f"显式指定的 IndexTTS2 配置文件不存在或不是有效文件（禁止静默回退官方原版）: {custom_path}"
+            )
+        resolved_cfg = custom_path.resolve()
+        gpt_ckpt = _extract_yaml_scalar(resolved_cfg, "gpt_checkpoint")
+        if not gpt_ckpt:
+            raise ValueError(
+                f"显式指定的 IndexTTS2 配置文件缺少 gpt_checkpoint 字段（禁止静默回退官方原版）: {resolved_cfg}"
+            )
+        gpt_path = Path(gpt_ckpt)
+        if not gpt_path.is_absolute():
+            gpt_path = (checkpoint_dir / gpt_path).resolve()
+        if not gpt_path.is_file():
+            raise FileNotFoundError(
+                f"显式指定的 IndexTTS2 配置指向的 GPT 权重不存在（禁止静默回退官方原版）: {gpt_path} (来自 {resolved_cfg})"
+            )
+        voice_mode = "personal" if resolved_cfg != default_cfg else "base"
+        return str(resolved_cfg), voice_mode
+
+    return str(default_cfg), "base"
+
+
+def _normalize_model_version_for_config(raw_version: Any) -> str:
+    mv = str(raw_version or "IndexTTS-2").strip()
+    if mv.lower() in {"indextts-2.5", "2.5", "indextts2.5"}:
+        mv = "IndexTTS-2.5"
+    else:
+        mv = "IndexTTS-2"
+    avail = _detect_available_versions()
+    if avail and mv not in avail:
+        mv = avail[0]
+    return mv
+
+
 def _resolve_effective_params(config: dict[str, Any], payload: dict[str, Any], text: str) -> dict[str, Any]:
     """合并默认配置与单次请求覆盖参数（支持前端独立调参及 AI API 覆盖）。"""
     tts_params = payload.get("tts_params")
@@ -539,9 +735,37 @@ def _resolve_effective_params(config: dict[str, Any], payload: dict[str, Any], t
             raise FileNotFoundError("当前情感模式为「情感参考音频」，请先上传情感参考音或填写有效本地音频路径。")
         emo_audio_resolved = str(_resolve_audio_path(emo_audio_raw))
 
+    # cfg_path 优先级：请求显式非空传参 > 环境变量 INDEX_TTS_CFG_PATH > config.json
+    # 注意：表单/客户端序列化的空字符串 "" 不得静默把个人模式降级回官方原版！
+    raw_cfg_path = ""
+    if "cfg_path" in tts_params and tts_params["cfg_path"] is not None:
+        if not isinstance(tts_params["cfg_path"], str):
+            raise ValueError("tts_params.cfg_path 必须为字符串。")
+        raw_cfg_path = tts_params["cfg_path"].strip().strip('"').strip("'")
+    elif "cfg_path" in payload and payload["cfg_path"] is not None:
+        if not isinstance(payload["cfg_path"], str):
+            raise ValueError("cfg_path 必须为字符串。")
+        raw_cfg_path = payload["cfg_path"].strip().strip('"').strip("'")
+
+    if not raw_cfg_path:
+        env_cfg = os.getenv("INDEX_TTS_CFG_PATH")
+        if env_cfg is not None and env_cfg.strip():
+            raw_cfg_path = env_cfg.strip().strip('"').strip("'")
+        else:
+            cfg_val = config.get("index_tts_cfg_path")
+            if cfg_val is not None and not isinstance(cfg_val, str):
+                raise ValueError("index_tts_cfg_path 必须为字符串。")
+            raw_cfg_path = (cfg_val or "").strip().strip('"').strip("'")
+
+    # 阶段 1 即完成自定义个人模型 YAML 与内部 GPT 权重校验，失败直接返回 400 且不污染 _STATUS
+    active_cfg_path, voice_mode = _resolve_and_validate_cfg_path(model_version, raw_cfg_path)
+
     return {
         "profile_name": profile_name,
         "model_version": model_version,
+        "cfg_path": raw_cfg_path,
+        "active_cfg_path": active_cfg_path,
+        "voice_mode": voice_mode,
         "chunk_size": chunk_size,
         "segments": segments,
         "use_fp16": bool(pick("use_fp16", "index_tts_use_fp16", True)),
@@ -686,9 +910,15 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
             for idx, seg in enumerate(segments)
         ]
 
+        # 纵深防御：即使直接调用 _run_studio_worker 也严格校验配置与内部权重，绝不静默回退官方原版
+        raw_custom_cfg = str(params.get("cfg_path") or "").strip()
+        if not raw_custom_cfg and "cfg_path" not in params:
+            raw_custom_cfg = (os.getenv("INDEX_TTS_CFG_PATH") or "").strip()
+        active_cfg_path, _voice_mode = _resolve_and_validate_cfg_path(model_version, raw_custom_cfg)
+
         job_payload = {
             "model_dir": str(checkpoint_dir),
-            "cfg_path": str(checkpoint_dir / "config.yaml"),
+            "cfg_path": active_cfg_path,
             "model_version": model_version,
             "use_fp16": params["use_fp16"],
             "use_bf16": params["use_fp16"],
@@ -895,14 +1125,78 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
 def healthz() -> Response:
     available, reason, versions = _engine_availability()
     status = _snapshot_status()
+    try:
+        cfg = _load_config()
+    except Exception as exc:
+        return jsonify(
+            {
+                "status": "degraded",
+                "backend": "index-tts2",
+                "engine_state": status["state"],
+                "index_tts_available": available,
+                "unavailable_reason": reason,
+                "available_versions": versions,
+                "model_version": "IndexTTS-2",
+                "voice_mode": "invalid",
+                "active_cfg_path": "",
+                "cfg_valid": False,
+                "cfg_error": str(exc),
+                "default_prompt": "",
+                "override_request_prompt": False,
+                "prompt_override_active": False,
+                "prompt_valid": False,
+                "prompt_error": str(exc),
+                "shared_root": str(SHARED_ROOT),
+                "engine_root": str(ENGINE_ROOT) if ENGINE_ROOT else None,
+            }
+        )
+    model_version = _normalize_model_version_for_config(cfg.get("index_tts_model_version", "IndexTTS-2"))
+    env_cfg = os.getenv("INDEX_TTS_CFG_PATH")
+    cfg_val = cfg.get("index_tts_cfg_path")
+    cfg_valid = True
+    cfg_error = ""
+    if env_cfg is not None and env_cfg.strip():
+        raw_custom_cfg = env_cfg.strip().strip('"').strip("'")
+    elif cfg_val is not None and not isinstance(cfg_val, str):
+        raw_custom_cfg = str(cfg_val)
+        active_cfg_path = raw_custom_cfg
+        voice_mode = "invalid"
+        cfg_valid = False
+        cfg_error = "index_tts_cfg_path 必须为字符串。"
+    else:
+        raw_custom_cfg = (cfg_val or "").strip().strip('"').strip("'")
+
+    if cfg_valid:
+        try:
+            active_cfg_path, voice_mode = _resolve_and_validate_cfg_path(model_version, raw_custom_cfg)
+        except Exception as exc:
+            active_cfg_path = raw_custom_cfg
+            voice_mode = "invalid"
+            cfg_valid = False
+            cfg_error = str(exc)
+
+    override_enabled, prompt_override_active, default_prompt, prompt_valid, prompt_error = _inspect_prompt_override_status(
+        cfg, voice_mode
+    )
+
     return jsonify(
         {
-            "status": "ok" if available else "degraded",
+            "status": "ok" if (available and cfg_valid and prompt_valid) else "degraded",
             "backend": "index-tts2",
             "engine_state": status["state"],
             "index_tts_available": available,
             "unavailable_reason": reason,
             "available_versions": versions,
+            "model_version": model_version,
+            "voice_mode": voice_mode,
+            "active_cfg_path": active_cfg_path,
+            "cfg_valid": cfg_valid,
+            "cfg_error": cfg_error,
+            "default_prompt": default_prompt,
+            "override_request_prompt": override_enabled,
+            "prompt_override_active": prompt_override_active,
+            "prompt_valid": prompt_valid,
+            "prompt_error": prompt_error,
             "shared_root": str(SHARED_ROOT),
             "engine_root": str(ENGINE_ROOT) if ENGINE_ROOT else None,
         }
@@ -912,22 +1206,32 @@ def healthz() -> Response:
 @app.get("/v1/tts/capabilities")
 def tts_capabilities() -> Response:
     available, reason, versions = _engine_availability()
+    config_error = ""
+    try:
+        current_cfg = _load_config()
+    except Exception as exc:
+        current_cfg = dict(DEFAULT_CONFIG)
+        config_error = str(exc)
     return jsonify(
         {
-            "available": available,
-            "unavailable_reason": reason,
+            "available": available and not config_error,
+            "unavailable_reason": config_error or reason,
             "versions": versions,
             "emo_vector_labels": EMO_VECTOR_LABELS,
             "languages": SUPPORTED_LANGUAGES,
             "default_config": DEFAULT_CONFIG,
-            "current_config": _load_config(),
+            "current_config": current_cfg,
+            "config_error": config_error,
         }
     )
 
 
 @app.get("/v1/tts/config")
 def get_tts_config() -> Response:
-    return jsonify({"code": 0, "config": _load_config()})
+    try:
+        return jsonify({"code": 0, "config": _load_config()})
+    except Exception as exc:
+        return jsonify({"code": 1, "msg": str(exc)}), 400
 
 
 @app.put("/v1/tts/config")
@@ -1013,7 +1317,9 @@ def invoke() -> Response:
     # 阶段 1：在获取 _GENERATE_LOCK 前完成参数与文件路径校验，失败直接返回 400，绝不覆盖正在合成中的任务状态
     try:
         config = _load_config()
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = {}
         if not isinstance(payload, dict):
             return jsonify({"code": 1, "msg": "请求体必须为 JSON 对象"}), 400
         raw_text = payload.get("text")
@@ -1023,9 +1329,10 @@ def invoke() -> Response:
         if not text:
             return jsonify({"code": 1, "msg": "待合成文本 text 不能为空"}), 400
 
-        reference_audio = payload.get("reference_audio") or config.get("index_tts_default_prompt") or ""
-        prompt_path = _resolve_audio_path(reference_audio)
         params = _resolve_effective_params(config, payload, text)
+        prompt_path, prompt_overridden, requested_prompt = _resolve_invoke_prompt(
+            config, payload, params["voice_mode"]
+        )
     except (FileNotFoundError, ValueError, TypeError) as exc:
         logger.warning("IndexTTS2 pre-validation rejected (job=%s): %s", job_id, exc)
         return jsonify({"code": 1, "msg": str(exc)}), 400
@@ -1041,10 +1348,27 @@ def invoke() -> Response:
                 _SYNTH_GEN += 1
                 _SYNTH_ACTIVE = True
             try:
+                if prompt_overridden:
+                    logger.info(
+                        "Personal voice mode prompt override active (job=%s): ignoring incoming reference_audio=%s -> using personal prompt=%s (cfg=%s)",
+                        job_id,
+                        requested_prompt,
+                        prompt_path,
+                        params.get("active_cfg_path"),
+                    )
+                elif params["voice_mode"] == "personal" and _extract_respect_request_prompt(payload) and requested_prompt:
+                    logger.info(
+                        "Personal voice mode opt-out (job=%s, respect_request_prompt=true): using requested reference_audio=%s",
+                        job_id,
+                        prompt_path,
+                    )
                 logger.info(
-                    "Synthesizing job=%s prompt=%s chars=%d segs=%d model=%s profile=%s beams=%d steps=%d emo=%s speed=%.2f",
+                    "Synthesizing job=%s prompt=%s voice_mode=%s cfg=%s prompt_overridden=%s chars=%d segs=%d model=%s profile=%s beams=%d steps=%d emo=%s speed=%.2f",
                     job_id,
-                    prompt_path.name,
+                    prompt_path,
+                    params["voice_mode"],
+                    params.get("active_cfg_path"),
+                    prompt_overridden,
                     len(text),
                     len(params["segments"]),
                     params["model_version"],
@@ -1073,6 +1397,8 @@ def invoke() -> Response:
         resp = Response(buffer.getvalue(), mimetype="audio/wav")
         resp.headers["X-TTS-Job-Id"] = job_id
         resp.headers["X-TTS-Model-Version"] = params["model_version"]
+        resp.headers["X-TTS-Voice-Mode"] = params.get("voice_mode", "base")
+        resp.headers["X-TTS-Prompt-Overridden"] = "true" if prompt_overridden else "false"
         resp.headers["X-TTS-Duration-Sec"] = f"{len(audio) / sample_rate:.3f}"
         return resp
     except InterruptedError as exc:

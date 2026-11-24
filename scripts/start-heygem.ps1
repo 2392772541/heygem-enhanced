@@ -500,7 +500,7 @@ function Start-StudioServer {
 
 # --- Main execution flow ---
 
-Write-Log 'Starting HeyGem Studio Web UI & Automation API (fast boot)...'
+Write-Log 'Starting HeyGem Studio Web Workbench (local & LAN visual UI)...'
 Start-StudioServer
 if (-not $NoBrowser) {
   Write-Log "Opening unified HeyGem Studio in browser: $studioUrl"

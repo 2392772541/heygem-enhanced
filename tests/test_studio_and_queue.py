@@ -1022,4 +1022,393 @@ def test_review_round2_queue_zero_max_retries_and_retry_resets_stale_progress(is
     assert int(m402["eta_seconds"]) == -1
 
 
+def _make_silent_mp4(path: Path) -> None:
+    """生成 1 秒纯画面无音轨短视频，用于验证静音底模视频导入容错。"""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=green:s=160x120:d=1:r=25",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        str(path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0 and path.is_file(), f"ffmpeg silent failed: {res.stderr}"
+
+
+def test_onboarding_discover_cleanup_missing_silent_and_safe_relink(isolated_env, monkeypatch):
+    from studio import system_ctrl
+    from studio.server import app
+
+    shoot_dir = isolated_env["delivery_dir"] / "拍摄的视频"
+    shoot_dir.mkdir(parents=True, exist_ok=True)
+    v1 = shoot_dir / "福联测试.mp4"
+    v2 = shoot_dir / "静音出镜.mp4"
+    _make_tiny_mp4(v1)
+    _make_silent_mp4(v2)
+    (shoot_dir / "empty.mp4").write_bytes(b"")
+    (shoot_dir / "说明.txt").write_text("ignore", encoding="utf-8")
+
+    corrupt_mp4 = isolated_env["tmp"] / "broken.mp4"
+    corrupt_mp4.write_bytes(b"NOT_A_VALID_VIDEO_FILE_123456")
+
+    with TestClient(app) as client:
+        # 1) 本地发现：只列出有效非空视频，排除空文件与文本文件
+        d0 = client.get("/api/v1/models/discover-local").json()
+        names = {it["name"] for it in d0["items"]}
+        assert names == {"福联测试", "静音出镜"}
+        assert all(it["already_imported"] is False for it in d0["items"])
+
+        # 2) 省略 name 时自动取文件名导入，且 discover-local 立即标为 already_imported=True
+        r_auto = client.post("/api/v1/models", data={"local_video_path": str(v1)})
+        assert r_auto.status_code == 200, r_auto.text
+        m1 = r_auto.json()["item"]
+        assert m1["name"] == "福联测试"
+        assert m1["video_exists"] is True and m1["audio_exists"] is True and m1["has_voice"] is True
+
+        d1 = client.get("/api/v1/models/discover-local").json()
+        by_name = {it["name"]: it for it in d1["items"]}
+        assert by_name["福联测试"]["already_imported"] is True
+        assert by_name["静音出镜"]["already_imported"] is False
+
+        # 3) 静音无音轨视频导入成功不崩溃，audio_exists=False
+        r_silent = client.post("/api/v1/models", data={"local_video_path": str(v2)})
+        assert r_silent.status_code == 200, r_silent.text
+        m_silent = r_silent.json()["item"]
+        assert m_silent["name"] == "静音出镜"
+        assert m_silent["video_exists"] is True and m_silent["audio_exists"] is False and m_silent["has_voice"] is False
+
+        # 4) 损坏视频导入必须返回 400 且 temp 目录零残留
+        before_temp = set(isolated_env["output_root"].glob("*"))
+        r_bad = client.post("/api/v1/models", data={"name": "坏文件", "local_video_path": str(corrupt_mp4)})
+        assert r_bad.status_code == 400
+        assert set(isolated_env["output_root"].glob("*")) == before_temp
+
+        # 5) 损坏视频 relink 到已有完好模特 -> 400 且原底模完好无损
+        orig_bytes = Path(m1["video_abs_path"]).read_bytes()
+        r_bad_relink = client.post(f"/api/v1/models/{m1['id']}/relink", data={"local_video_path": str(corrupt_mp4)})
+        assert r_bad_relink.status_code == 400
+        assert Path(m1["video_abs_path"]).read_bytes() == orig_bytes
+
+        # 6) 构造 3 条缺失底模的旧模特（其中 1 条有 waiting 活跃任务）+ 1 条保留音色，验证 cleanup-missing 精准清理且护航活跃任务和声音库
+        conn = sqlite3.connect(isolated_env["db"])
+        now_ms = int(time.time() * 1000)
+        conn.execute("INSERT INTO voice (id, origin_audio_path, asr_format_audio_url, created_at) VALUES (901, 'origin_audio/old.wav', 'old.wav', ?)", (now_ms,))
+        conn.execute("INSERT INTO f2f_model (id, name, video_path, audio_path, voice_id, created_at) VALUES (901, '旧缺失1', 'gone1.mp4', 'origin_audio/old.wav', 901, ?)", (now_ms,))
+        conn.execute("INSERT INTO f2f_model (id, name, video_path, audio_path, voice_id, created_at) VALUES (902, '旧缺失2', 'gone2.mp4', '', NULL, ?)", (now_ms,))
+        conn.execute("INSERT INTO f2f_model (id, name, video_path, audio_path, voice_id, created_at) VALUES (903, '旧缺失活跃', 'gone3.mp4', '', NULL, ?)", (now_ms,))
+        conn.execute("INSERT INTO video (id, status, model_id, created_at, name) VALUES (950, 'waiting', 903, ?, '占用活跃任务')", (now_ms,))
+        conn.execute("INSERT INTO video (id, status, model_id, created_at, name) VALUES (951, 'success', 901, ?, '历史成片')", (now_ms,))
+        conn.commit()
+        conn.close()
+
+        c_res = client.post("/api/v1/models/cleanup-missing")
+        assert c_res.status_code == 200
+        cdata = c_res.json()
+        assert cdata["deleted_count"] == 2
+        assert set(cdata["deleted_ids"]) == {901, 902}
+        assert cdata["skipped_active_ids"] == [903]
+
+        rem_ids = {it["id"] for it in client.get("/api/v1/models").json()["items"]}
+        assert m1["id"] in rem_ids and m_silent["id"] in rem_ids and 903 in rem_ids
+        assert 901 not in rem_ids and 902 not in rem_ids
+
+        # 历史声音库与历史成片必须完好保留
+        conn = sqlite3.connect(isolated_env["db"])
+        assert conn.execute("SELECT COUNT(*) FROM voice WHERE id=901").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM video WHERE id=951").fetchone()[0] == 1
+        conn.close()
+
+        # 7) pick-file 参数校验与响应透传
+        assert client.post("/api/v1/system/pick-file", json={"kind": "invalid"}).status_code == 422
+        monkeypatch.setattr(system_ctrl, "pick_local_files", lambda kind="video", multi=False, initial_dir=None: {"ok": True, "cancelled": False, "paths": [str(v1)]})
+        p_ok = client.post("/api/v1/system/pick-file", json={"kind": "video", "multi": False})
+        assert p_ok.status_code == 200 and p_ok.json()["paths"] == [str(v1)]
+
+        monkeypatch.setattr(system_ctrl, "pick_local_files", lambda kind="video", multi=False, initial_dir=None: {"ok": True, "cancelled": True, "paths": []})
+        p_cancel = client.post("/api/v1/system/pick-file", json={"kind": "audio", "multi": True})
+        assert p_cancel.status_code == 200 and p_cancel.json()["cancelled"] is True
+
+
+def test_review_thumb_relink_voice_probe_hardening_and_local_guards(isolated_env, monkeypatch):
+    import shutil
+
+    from studio import server as studio_server
+    from studio import system_ctrl
+    from studio.server import app
+
+    tmp = isolated_env["tmp"]
+    silent_mp4 = tmp / "silent_src.mp4"
+    talking_mov = tmp / "talking_src.mov"
+    fake_jpg_mp4 = tmp / "still_image_as_video.mp4"
+    fake_mp3_art_mp4 = tmp / "mp3_cover_as_video.mp4"
+    bad_exe = tmp / "danger.exe"
+    bad_exe.write_bytes(b"MZ_FAKE_EXE")
+
+    _make_silent_mp4(silent_mp4)
+    # 生成有声 .mov（验证 relink 换后缀清理旧文件 + 为原静音模特补提音色 + 缩略图刷新）
+    res_mov = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "color=c=red:s=160x120:d=1:r=25",
+            "-f", "lavfi", "-i", "sine=frequency=520:duration=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            str(talking_mov),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res_mov.returncode == 0 and talking_mov.is_file()
+
+    # 生成伪装成 .mp4 的单帧 JPEG 静态图
+    real_jpg = tmp / "pic.jpg"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=yellow:s=64x64:d=0.1", "-frames:v", "1", str(real_jpg)],
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    shutil.copy2(real_jpg, fake_jpg_mp4)
+
+    # 生成带封面图 (attached_pic) 的 MP3 并改名为 .mp4
+    mp3_with_art = tmp / "song.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-i", str(real_jpg),
+            "-map", "0:a", "-map", "1:v",
+            "-c:a", "libmp3lame", "-c:v", "mjpeg",
+            "-disposition:v:0", "attached_pic",
+            str(mp3_with_art),
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    shutil.copy2(mp3_with_art, fake_mp3_art_mp4)
+
+    with TestClient(app) as client:
+        # 1) 静态图片与带封面图的 MP3 伪装为 .mp4 必须被 _probe_media_streams 拒之门外且零磁盘拷贝残留
+        before_files = set(isolated_env["output_root"].glob("*"))
+        assert client.post("/api/v1/models", data={"local_video_path": str(fake_jpg_mp4)}).status_code == 400
+        assert client.post("/api/v1/models", data={"local_video_path": str(fake_mp3_art_mp4)}).status_code == 400
+        assert set(isolated_env["output_root"].glob("*")) == before_files
+
+        # 2) 导入静音视频 -> 获取 JPEG 缩略图成功并缓存
+        r_m = client.post("/api/v1/models", data={"name": "静音模特", "local_video_path": str(silent_mp4)})
+        assert r_m.status_code == 200
+        m = r_m.json()["item"]
+        assert m["thumb_url"].startswith(f"/api/v1/media/model/{m['id']}/thumb")
+        assert m["has_voice"] is False and m["voice_id"] is None
+        old_video_path = Path(m["video_abs_path"])
+        assert old_video_path.is_file()
+
+        r_thumb = client.get(m["thumb_url"])
+        assert r_thumb.status_code == 200
+        assert r_thumb.headers["content-type"].startswith("image/jpeg")
+        assert r_thumb.content[:3] == b"\xff\xd8\xff"
+
+        # 3) 用有声 .mov relink 静音模特 -> 自动补建音色、清理旧 .mp4 孤儿文件、缩略图刷新正常
+        r_rel = client.post(f"/api/v1/models/{m['id']}/relink", data={"local_video_path": str(talking_mov)})
+        assert r_rel.status_code == 200, r_rel.text
+        m2 = r_rel.json()["item"]
+        assert m2["video_exists"] is True
+        assert m2["has_voice"] is True and m2["audio_exists"] is True and m2["voice_id"] is not None
+        assert Path(m2["video_abs_path"]).suffix.lower() == ".mov"
+        assert not old_video_path.exists()
+
+        r_thumb2 = client.get(m2["thumb_url"])
+        assert r_thumb2.status_code == 200 and r_thumb2.content[:3] == b"\xff\xd8\xff"
+
+        # 4) pick-file 服务端并发锁 409 防护
+        assert system_ctrl._PICK_DIALOG_LOCK.acquire(blocking=False)
+        try:
+            r_busy = client.post("/api/v1/system/pick-file", json={"kind": "video", "multi": False})
+            assert r_busy.status_code == 409
+        finally:
+            system_ctrl._PICK_DIALOG_LOCK.release()
+
+        # 5) open-media 后缀白名单与安全防护
+        assert client.post("/api/v1/system/open-media", json={"path": str(bad_exe)}).status_code == 400
+        assert client.post("/api/v1/system/open-media", json={"path": str(tmp / "not_exist.mp4")}).status_code == 404
+        monkeypatch.setattr(system_ctrl, "open_media_in_player", lambda p: (True, f"opened:{Path(p).name}"))
+        r_open_ok = client.post("/api/v1/system/open-media", json={"path": str(talking_mov)})
+        assert r_open_ok.status_code == 200 and "opened:" in r_open_ok.json()["message"]
+
+        # 6) 远程非本机客户端调用 pick-file / open-path / open-media 必须返回 403
+        monkeypatch.setattr(studio_server, "_is_local_client", lambda req: False)
+        assert client.post("/api/v1/system/pick-file", json={"kind": "video"}).status_code == 403
+        assert client.post("/api/v1/system/open-path", json={"path": str(tmp)}).status_code == 403
+        assert client.post("/api/v1/system/open-media", json={"path": str(talking_mov)}).status_code == 403
+
+
+def test_workbench_access_info_video_thumb_and_no_hub_branding(isolated_env, monkeypatch):
+    """验证新版可视化工作台定位（去除中枢API）、本机/服务器访问信息隔离与成品视频缩略图回退逻辑。"""
+    import studio.server as studio_server
+    import studio.system_ctrl as system_ctrl
+    from studio.db import get_conn, upsert_job_meta
+
+    tmp = isolated_env["tmp"]
+    avatar_mp4 = tmp / "host_avatar.mp4"
+    result_mp4 = tmp / "finished_result.mp4"
+    _make_tiny_mp4(avatar_mp4)
+    _make_tiny_mp4(result_mp4)
+
+    # 1) 验证网络访问信息在不同 bind_host 下的行为（且过滤代理 TUN 198.18.0.0/15）
+    acc_default = system_ctrl.get_network_access_info(port=8390, bind_host="0.0.0.0")
+    assert acc_default["lan_enabled"] is True
+    assert acc_default["local_url"] == "http://127.0.0.1:8390"
+    assert all("198.18." not in u and "198.19." not in u for u in acc_default["lan_urls"])
+
+    acc_local_only = system_ctrl.get_network_access_info(port=8390, bind_host="127.0.0.1")
+    assert acc_local_only["lan_enabled"] is False
+    assert acc_local_only["lan_urls"] == []
+
+    with TestClient(studio_server.app) as client:
+        # 2) 首页包含 6 大独立系统视图且不出现“统一中枢”字样
+        idx = client.get("/")
+        assert idx.status_code == 200
+        for view_id in ("view-create", "view-voice", "view-tasks", "view-library", "view-models", "view-system"):
+            assert f'id="{view_id}"' in idx.text
+        assert "统一中枢" not in idx.text
+
+        openapi = client.get("/openapi.json").json()
+        assert "统一中枢" not in openapi["info"]["title"]
+
+        # 3) health 接口返回 access 字段，且本机/远程请求互不污染缓存
+        monkeypatch.setattr(studio_server, "_is_local_client", lambda req: True)
+        h_local = client.get("/api/v1/health?force=true").json()
+        assert h_local["access"]["client_is_local"] is True
+        assert h_local["access"]["client_mode"] == "local"
+
+        monkeypatch.setattr(studio_server, "_is_local_client", lambda req: False)
+        h_remote = client.get("/api/v1/health").json()
+        assert h_remote["access"]["client_is_local"] is False
+        assert h_remote["access"]["client_mode"] == "remote"
+
+        monkeypatch.setattr(studio_server, "_is_local_client", lambda req: True)
+        h_local_again = client.get("/api/v1/health").json()
+        assert h_local_again["access"]["client_is_local"] is True
+        assert h_local_again["access"]["client_mode"] == "local"
+
+        # 4) 成品视频缩略图提取、成片移走时回退人物封面、删除任务时自动清理缓存
+        m_res = client.post("/api/v1/models", data={"name": "封面测试人物", "local_video_path": str(avatar_mp4)})
+        assert m_res.status_code == 200
+        model_id = m_res.json()["item"]["id"]
+
+        j_res = client.post("/api/v1/jobs", json={"model_id": model_id, "name": "成品封面测试", "text": "测试封面"})
+        assert j_res.status_code == 200
+        job_id = j_res.json()["job_id"]
+
+        delivered = isolated_env["delivery_dir"] / f"{job_id}_成品封面测试.mp4"
+        delivered.write_bytes(result_mp4.read_bytes())
+        conn = get_conn()
+        try:
+            conn.execute("UPDATE video SET status='success', progress=100 WHERE id=?", (job_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        upsert_job_meta(job_id, phase="success", progress_float=100.0, delivered_path=str(delivered))
+
+        job_detail = client.get(f"/api/v1/jobs/{job_id}").json()["item"]
+        assert job_detail["thumb_url"].startswith(f"/api/v1/media/video/{job_id}/thumb")
+
+        t1 = client.get(job_detail["thumb_url"])
+        assert t1.status_code == 200
+        assert t1.headers["content-type"].startswith("image/jpeg")
+        assert t1.content[:3] == b"\xff\xd8\xff"
+        cached_thumb = studio_server._video_thumb_path(job_id)
+        assert cached_thumb.is_file()
+
+        # 模拟成片被移走 -> 缩略图仍优雅回退人物底模封面，不返回 404
+        delivered.unlink()
+        t_fallback = client.get(f"/api/v1/media/video/{job_id}/thumb")
+        assert t_fallback.status_code == 200
+        assert t_fallback.content[:3] == b"\xff\xd8\xff"
+
+        job_after_move = client.get(f"/api/v1/jobs/{job_id}").json()["item"]
+        assert job_after_move["file_exists"] is False
+        assert job_after_move["thumb_url"] == f"/api/v1/media/model/{model_id}/thumb"
+
+        # 删除任务自动清理成片缩略图缓存
+        del_r = client.delete(f"/api/v1/jobs/{job_id}")
+        assert del_r.status_code == 200
+        assert not cached_thumb.exists()
+
+
+def test_review_round3_uploads_contracts_proxy_and_friendly_errors(isolated_env, monkeypatch):
+    """回归验证：反向代理远程识别、分组置空归一化、离线语音友好报错及前后端关键字段契约一致性。"""
+    import studio.server as studio_server
+    import studio.system_ctrl as system_ctrl
+    from studio.db import get_conn
+
+    tmp = isolated_env["tmp"]
+    avatar_mp4 = tmp / "contract_avatar.mp4"
+    _make_tiny_mp4(avatar_mp4)
+
+    with TestClient(studio_server.app) as client:
+        # 1) 首页带 no-cache，避免旧版浏览器缓存残留
+        idx = client.get("/")
+        assert idx.status_code == 200
+        assert "no-cache" in idx.headers.get("cache-control", "").lower()
+
+        # 2) 反向代理携带 X-Forwarded-For / X-Real-IP 必须识别为远程客户端并拦截宿主机桌面动作
+        h_xff = client.get("/api/v1/health", headers={"X-Forwarded-For": "203.0.113.42, 10.0.0.1"}).json()
+        assert h_xff["access"]["client_is_local"] is False
+        assert h_xff["access"]["client_mode"] == "remote"
+        assert client.post(
+            "/api/v1/system/pick-file",
+            json={"kind": "video"},
+            headers={"X-Forwarded-For": "203.0.113.42"},
+        ).status_code == 403
+
+        h_xreal = client.get("/api/v1/health", headers={"X-Real-IP": "198.51.100.7"}).json()
+        assert h_xreal["access"]["client_is_local"] is False
+
+        # 3) 模特分组传 0 或 None 均归一化为 SQL NULL，确保 group_id=ungrouped 查询一致
+        g_res = client.post("/api/v1/model-groups", json={"name": "契约测试分组"})
+        assert g_res.status_code == 200
+        gid = g_res.json()["item"]["id"]
+
+        m_res = client.post("/api/v1/models", data={"name": "分组测试人物", "local_video_path": str(avatar_mp4)})
+        assert m_res.status_code == 200
+        mid = m_res.json()["item"]["id"]
+
+        assert client.patch(f"/api/v1/models/{mid}", json={"group_id": gid}).status_code == 200
+        assert client.patch(f"/api/v1/models/{mid}", json={"group_id": 0}).status_code == 200
+
+        conn = get_conn()
+        try:
+            db_gid = conn.execute("SELECT group_id FROM f2f_model WHERE id=?", (mid,)).fetchone()[0]
+        finally:
+            conn.close()
+        assert db_gid is None
+        ungrouped = client.get("/api/v1/models?group_id=ungrouped").json()["items"]
+        assert any(it["id"] == mid for it in ungrouped)
+
+        # 4) IndexTTS2 语音引擎离线时返回友好中文提示，不裸露 WinError/urlopen 堆栈
+        monkeypatch.setattr(system_ctrl, "TTS_BASE_URL", "http://127.0.0.1:19997")
+        r_tts = client.post("/api/v1/tts/synthesize", json={"text": "测试离线报错", "voice_id": m_res.json()["item"]["voice_id"]})
+        assert r_tts.status_code == 503
+        detail = r_tts.json()["detail"]
+        assert "WinError" not in detail and "urlopen" not in detail
+        assert "18180" in detail and "一键启动服务" in detail
+
+    # 5) 静态前端与后端关键契约防回归检查（防止字段名错配导致上传/配置加载静默失效）
+    app_js = (studio_server.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'fd.append("video"' not in app_js
+    assert 'fd.append("files", f)' in app_js
+    assert 'res.deleted_count' in app_js and 'res.removed_count' not in app_js
+    assert 'cfgRes.config' in app_js
+    assert 'sourceType === "tts"' in app_js
+    assert 'local_audio_path' not in app_js
+    assert 'group_id: groupVal ? Number(groupVal) : null' in app_js
+
+
+
+
+
+
 

@@ -1,4 +1,4 @@
-# HeyGem-Enhanced · HeyGem Studio 数字人一体化工作台与自动化生产中枢
+# HeyGem-Enhanced · HeyGem Studio 数字人一体化工作台
 
 基于官方 **Duix.Avatar (HeyGem)** 深度二次开发与生产级重构的本地数字人创作中心。内置全新 **HeyGem Studio 一体化 Web 工作台**，将数字人形象管理、**IndexTTS-2 / IndexTTS-2.5** 语音全参数调控试听、实时帧级进度监控、任务随时中断与自愈恢复、作品分类下载以及标准化 **AI 自动化 REST API** 全部融合在一个无黑框浏览器界面中。
 
@@ -150,7 +150,7 @@ HeyGem-Enhanced/
 ├── Install-Shortcuts.bat             # 一键在桌面创建分类控制启动器
 ├── tts-mode.txt                      # 当前 TTS 模式 (index-tts2 / fish-speech)
 │
-├── studio/                           # HeyGem Studio 统一中枢与 Web 工作台
+├── studio/                           # HeyGem Studio 本机与服务器通用 Web 可视化工作台
 │   ├── server.py                     # FastAPI 后端、媒体流、自动化 AI REST API
 │   ├── db.py                         # SQLite 扩展表初始化与媒体探测工具
 │   ├── system_ctrl.py                # 健康聚合、Docker Desktop 自动拉起与自愈控制
@@ -177,7 +177,7 @@ HeyGem-Enhanced/
 
 1. **环境准备**：Windows 10/11 64 位 + NVIDIA RTX 显卡（推荐 12GB+ 显存），安装 Python 3.10~3.12 与 Docker Desktop（启用 WSL2 + NVIDIA Container Toolkit）。
 2. **安装依赖**：
-   - Studio Web 中枢需要 `fastapi`、`uvicorn`、`python-multipart`（已包含于常规 Python 环境或 `pip install fastapi uvicorn python-multipart`）。
+   - Studio Web 工作台需要 `fastapi`、`uvicorn`、`python-multipart`（已包含于常规 Python 环境或 `pip install fastapi uvicorn python-multipart`）。
    - IndexTTS2 适配器依赖：`pip install -r adapter\requirements.txt`（若本机未部署 IndexTTS2 权重，启动脚本自动平滑降级为官方 Docker Fish-Speech）。
 3. **拉取渲染镜像**：在 `deploy/` 目录执行 `docker compose pull`。
 4. **一键启动**：双击 `Start-Studio.vbs`，等待浏览器打开工作台并观察顶部健康指示灯全部变绿即可开始使用。
@@ -185,7 +185,7 @@ HeyGem-Enhanced/
 ### 常用环境变量（可选覆盖）
 | 环境变量名 | 默认探测逻辑 | 说明 |
 | :--- | :--- | :--- |
-| `HEYGEM_STUDIO_HOST` / `PORT` | `127.0.0.1` / `8390` | Studio Web 工作台监听地址与端口 |
+| `HEYGEM_STUDIO_HOST` / `PORT` | `0.0.0.0` / `8390` | Studio Web 工作台监听地址与端口（支持本机与局域网/服务器访问） |
 | `HEYGEM_STUDIO_API_KEY` | 空（不鉴权） | 开启后要求 REST API 请求携带 `X-API-Key` 或 `Bearer` Token |
 | `DUIX_DATA_DIR` | `D:/duix_avatar_data` | Docker 容器共享数据根目录 |
 | `HEYGEM_DELIVERY_ROOT` | `E:\数字人视频文件` -> `D:\...` | 成片自动归档交付目录 |

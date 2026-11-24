@@ -3,7 +3,9 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -51,6 +53,94 @@ def invalidate_health_cache() -> None:
     with _HEALTH_CACHE_LOCK:
         _HEALTH_CACHE_TS = 0.0
     _PS_PROC_CACHE.clear()
+
+
+def get_network_access_info(port: int | None = None, bind_host: str | None = None) -> dict[str, Any]:
+    """获取本机与局域网/服务器可视化访问地址，自动过滤代理 TUN 与虚拟网桥地址并按实用性排序。"""
+    import ipaddress
+
+    resolved_port = int(port if port is not None else (os.getenv("HEYGEM_STUDIO_PORT") or "8390"))
+    resolved_host = (bind_host if bind_host is not None else (os.getenv("HEYGEM_STUDIO_HOST") or "0.0.0.0")).strip() or "0.0.0.0"
+    raw_ips: list[str] = []
+
+    def _add_raw(ip: str) -> None:
+        val = (ip or "").strip()
+        if not val or val in raw_ips:
+            return
+        try:
+            addr = ipaddress.IPv4Address(val)
+        except ValueError:
+            return
+        # 过滤回环、未指定、链路本地、多播、以及代理软件常用的 198.18.0.0/15 TUN 虚拟网段
+        if (
+            addr.is_loopback
+            or addr.is_unspecified
+            or addr.is_link_local
+            or addr.is_multicast
+            or addr in ipaddress.IPv4Network("198.18.0.0/15")
+        ):
+            return
+        raw_ips.append(val)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.2)
+            sock.connect(("8.8.8.8", 80))
+            _add_raw(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            _add_raw(str(info[4][0]))
+    except OSError:
+        pass
+
+    lan_enabled = resolved_host in {"0.0.0.0", "::", "*"} or (
+        resolved_host not in {"127.0.0.1", "localhost", "::1"}
+    )
+    if resolved_host not in {"0.0.0.0", "::", "*", "127.0.0.1", "localhost", "::1"}:
+        _add_raw(resolved_host)
+
+    cgnat_net = ipaddress.IPv4Network("100.64.0.0/10")
+
+    def _classify(ip: str) -> tuple[int, str, bool]:
+        addr = ipaddress.IPv4Address(ip)
+        octets = ip.split(".")
+        is_host_bridge_dot1 = (
+            addr.is_private
+            and octets[-1] == "1"
+            and (octets[0] in ("192", "172") or (octets[0] == "10" and octets[2] == "0"))
+        )
+        if addr in cgnat_net:
+            return (2, "组网 / Tailscale", False)
+        if addr.is_private:
+            if is_host_bridge_dot1:
+                return (4, "虚拟网卡", True)
+            return (1, "局域网", False)
+        return (3, "服务器 / 公网", False)
+
+    scored = [(*_classify(ip), ip) for ip in raw_ips]
+    # 若存在真实局域网/组网/公网地址，则隐藏 VMware/WSL 等 .1 虚拟宿主网桥减少干扰
+    non_bridge = [item for item in scored if not item[2]]
+    chosen = sorted(non_bridge if non_bridge else scored, key=lambda x: (x[0], x[3]))[:6]
+
+    lan_entries = (
+        [{"url": f"http://{ip}:{resolved_port}", "ip": ip, "label": label} for _, label, _, ip in chosen]
+        if lan_enabled
+        else []
+    )
+    lan_urls = [e["url"] for e in lan_entries]
+
+    return {
+        "bind_host": resolved_host,
+        "port": resolved_port,
+        "lan_enabled": lan_enabled,
+        "local_url": f"http://127.0.0.1:{resolved_port}",
+        "lan_urls": lan_urls,
+        "lan_entries": lan_entries,
+        "hostname": socket.gethostname(),
+    }
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -439,7 +529,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             {
                 "severity": "error",
                 "code": "INDEXTTS2_DOWN",
-                "message": "IndexTTS2 本地语音服务 (18180) 未就绪，无法进行文本配音；点击「一键自愈恢复」即可后台无框拉起。",
+                "message": "IndexTTS2 本地语音服务 (18180) 未就绪，无法进行文本配音；点击「一键启动服务」即可后台无框拉起。",
             }
         )
 
@@ -448,7 +538,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             {
                 "severity": "warning",
                 "code": "QUEUE_DAEMON_DOWN",
-                "message": "后台任务队列调度器未运行，新提交的视频任务将停留在排队中；点击「一键自愈恢复」可立即拉起。",
+                "message": "后台任务队列调度器未运行，新提交的视频任务将停留在排队中；点击「一键启动服务」可立即拉起。",
             }
         )
     elif queue_paused:
@@ -456,7 +546,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             {
                 "severity": "info",
                 "code": "QUEUE_PAUSED",
-                "message": "任务队列当前处于【暂停派发】状态，点击顶部「恢复队列」即可继续处理排队任务。",
+                "message": "任务队列当前处于【暂停派发】状态，点击「恢复队列」即可继续处理排队任务。",
             }
         )
 
@@ -466,7 +556,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             {
                 "severity": "warning",
                 "code": "FAILED_JOBS",
-                "message": f"当前有 {failed_cnt} 个失败任务，请打开「任务监控」查看具体报错原因或一键重试。",
+                "message": f"当前有 {failed_cnt} 个失败任务，请打开左侧「任务与进度」查看具体报错原因或一键重试。",
             }
         )
 
@@ -475,7 +565,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             {
                 "severity": "warning",
                 "code": "MODEL_FILES_MISSING",
-                "message": f"检测到 {len(missing_models)}/{total_models} 个数字人模特的底模视频文件在 {output_root} 中缺失，请在「模特与音色」页面重新关联或导入。",
+                "message": f"检测到 {len(missing_models)}/{total_models} 个历史人物的原视频文件在 {output_root} 中缺失，可在「人物与声音」页面补回视频或一键清理。",
             }
         )
 
@@ -521,6 +611,7 @@ def get_system_health(force: bool = False) -> dict[str, Any]:
             "voice_root": str(resolve_voice_root()),
             "delivery_root": str(resolve_delivery_root()),
         },
+        "access": get_network_access_info(),
         "alerts": alerts,
     }
     with _HEALTH_CACHE_LOCK:
@@ -859,11 +950,18 @@ def stop_background_services() -> dict[str, Any]:
     return {"ok": all(s["ok"] for s in steps), "steps": steps}
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(line: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", line)
+
+
 def _tail_file(path: Path, max_lines: int) -> list[str]:
     if not path.exists():
         return []
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = [_strip_ansi(ln) for ln in path.read_text(encoding="utf-8", errors="replace").splitlines()]
         return lines[-max_lines:]
     except Exception as exc:
         return [f"读取日志失败: {exc}"]
@@ -899,7 +997,7 @@ def read_service_logs(source: str = "queue", tail: int = 120) -> dict[str, Any]:
                 creationflags=CREATE_NO_WINDOW,
             )
             blob = "\n".join(p for p in ((res.stdout or ""), (res.stderr or "")) if p)
-            filtered = [ln for ln in blob.splitlines() if "/easy/query" not in ln and ln.strip()]
+            filtered = [_strip_ansi(ln) for ln in blob.splitlines() if "/easy/query" not in ln and ln.strip()]
             return {"source": "docker", "lines": filtered[-tail:]}
         except Exception as exc:
             return {"source": "docker", "lines": [f"获取 Docker 日志失败: {exc}"]}
@@ -911,6 +1009,8 @@ def read_service_logs(source: str = "queue", tail: int = 120) -> dict[str, Any]:
 
 
 def open_path_in_explorer(target_path: str) -> tuple[bool, str]:
+    if os.name != "nt":
+        return False, "当前为非 Windows 服务器环境，无法在服务端弹出资源管理器，请改用网页下载"
     cleaned = clean_local_path(target_path)
     if not cleaned:
         return False, "路径为空"
@@ -925,3 +1025,236 @@ def open_path_in_explorer(target_path: str) -> tuple[bool, str]:
         subprocess.Popen(["explorer.exe", str(p.parent)], creationflags=CREATE_NO_WINDOW)
         return True, f"文件不存在，已打开其上级目录: {p.parent}"
     return False, f"目标路径不存在: {p}"
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg"}
+_PICK_DIALOG_LOCK = threading.Lock()
+
+
+def open_media_in_player(target_path: str) -> tuple[bool, str]:
+    """用 Windows 默认播放器打开本机音视频文件（严格限定允许的媒体后缀，禁止执行脚本/可执行程序）。"""
+    cleaned = clean_local_path(target_path)
+    if not cleaned:
+        return False, "媒体路径为空"
+    p = Path(cleaned)
+    if not p.is_file():
+        return False, f"媒体文件不存在: {p}"
+    if p.suffix.lower() not in (VIDEO_EXTS | AUDIO_EXTS):
+        return False, f"仅允许打开音视频文件，不支持: {p.suffix or '(无后缀)'}"
+    if os.name != "nt":
+        return False, "当前非 Windows 环境，无法调用本机默认播放器"
+    try:
+        os.startfile(str(p))  # type: ignore[attr-defined]
+        return True, f"已使用本机默认播放器打开: {p.name}"
+    except Exception as exc:
+        return False, f"调用本机播放器失败: {exc}"
+
+
+def _default_pick_dir(kind: str, initial_dir: str | None = None) -> Path | None:
+    cleaned = clean_local_path(initial_dir)
+    if cleaned and Path(cleaned).is_dir():
+        return Path(cleaned)
+    delivery = resolve_delivery_root()
+    candidates: list[Path] = []
+    if kind == "video":
+        candidates.extend([delivery / "拍摄的视频", delivery / "底模视频", delivery, Path.home() / "Videos", Path.home() / "Desktop"])
+    else:
+        candidates.extend([delivery, Path.home() / "Music", Path.home() / "Desktop"])
+    for cand in candidates:
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def pick_local_files(kind: str = "video", multi: bool = False, initial_dir: str | None = None) -> dict[str, Any]:
+    """呼出 Windows 原生文件选择对话框，直接返回本机绝对路径，避免大文件经浏览器上传卡顿。"""
+    if os.name != "nt":
+        return {"ok": False, "cancelled": True, "paths": [], "detail": "当前非 Windows 环境，请改用网页上传文件"}
+
+    # 服务端单实例互斥，避免多标签页或并发请求同时弹出多个系统选择框
+    if not _PICK_DIALOG_LOCK.acquire(blocking=False):
+        return {"ok": False, "busy": True, "cancelled": True, "paths": [], "detail": "文件选择窗口已经打开，请先在系统窗口中完成选择或取消"}
+
+    try:
+        norm_kind = (kind or "video").strip().lower()
+        if norm_kind == "audio":
+            title = "选择录音/音频文件" if not multi else "选择一条或多条录音/音频文件"
+            file_filter = "音频文件 (*.wav;*.mp3;*.m4a;*.flac;*.aac;*.ogg)|*.wav;*.mp3;*.m4a;*.flac;*.aac;*.ogg|所有文件 (*.*)|*.*"
+        else:
+            title = "选择人物出镜视频（建议正面清晰、光线稳定）"
+            file_filter = "视频文件 (*.mp4;*.mov;*.mkv;*.avi;*.webm)|*.mp4;*.mov;*.mkv;*.avi;*.webm|所有文件 (*.*)|*.*"
+
+        start_dir = _default_pick_dir(norm_kind, initial_dir)
+
+        # 使用 TopMost 隐藏宿主窗体 + Win32 AttachThreadInput/SetForegroundWindow，避免弹窗藏在浏览器后面
+        ps_script = (
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "try { "
+            "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+            "public static class HeyGemFgHelper { "
+            "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
+            "[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid); "
+            "[DllImport(\"kernel32.dll\")] public static extern uint GetCurrentThreadId(); "
+            "[DllImport(\"user32.dll\")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach); "
+            "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd); "
+            "[DllImport(\"user32.dll\")] public static extern bool BringWindowToTop(IntPtr hWnd); "
+            "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow); "
+            "public static void ForceForeground(IntPtr hWnd) { "
+            "IntPtr fg = GetForegroundWindow(); uint d; uint fgT = GetWindowThreadProcessId(fg, out d); uint curT = GetCurrentThreadId(); "
+            "if (fgT != 0 && fgT != curT) { AttachThreadInput(curT, fgT, true); ShowWindow(hWnd, 5); BringWindowToTop(hWnd); SetForegroundWindow(hWnd); AttachThreadInput(curT, fgT, false); } "
+            "else { BringWindowToTop(hWnd); SetForegroundWindow(hWnd); } "
+            "} }' } catch {}; "
+            "$owner = New-Object System.Windows.Forms.Form; "
+            "$owner.TopMost = $true; "
+            "$owner.StartPosition = 'CenterScreen'; "
+            "$owner.ShowInTaskbar = $false; "
+            "$owner.Opacity = 0; "
+            "$owner.Width = 1; $owner.Height = 1; "
+            "$dlg = New-Object System.Windows.Forms.OpenFileDialog; "
+            "$dlg.Title = $env:HEYGEM_PICK_TITLE; "
+            "$dlg.Filter = $env:HEYGEM_PICK_FILTER; "
+            "$dlg.Multiselect = ($env:HEYGEM_PICK_MULTI -eq '1'); "
+            "$dlg.RestoreDirectory = $true; "
+            "if ($env:HEYGEM_PICK_DIR -and (Test-Path -LiteralPath $env:HEYGEM_PICK_DIR)) { $dlg.InitialDirectory = $env:HEYGEM_PICK_DIR }; "
+            "$owner.Show(); "
+            "try { [HeyGemFgHelper]::ForceForeground($owner.Handle) } catch {}; "
+            "$owner.Activate(); "
+            "$res = $dlg.ShowDialog($owner); "
+            "$owner.Close(); $owner.Dispose(); "
+            "if ($res -eq [System.Windows.Forms.DialogResult]::OK) { "
+            "  $arr = @($dlg.FileNames); "
+            "  [Console]::WriteLine((ConvertTo-Json -InputObject $arr -Compress)) "
+            "} else { [Console]::WriteLine('[]') }"
+        )
+        env = os.environ.copy()
+        env["HEYGEM_PICK_TITLE"] = title
+        env["HEYGEM_PICK_FILTER"] = file_filter
+        env["HEYGEM_PICK_MULTI"] = "1" if multi else "0"
+        env["HEYGEM_PICK_DIR"] = str(start_dir) if start_dir else ""
+
+        try:
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-STA", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode != 0:
+                err = (res.stderr or res.stdout or "").strip()[:200]
+                return {"ok": False, "cancelled": True, "paths": [], "detail": f"打开文件选择窗口失败：{err or '未知错误'}"}
+            raw_out = (res.stdout or "").strip()
+            last_line = raw_out.splitlines()[-1].strip() if raw_out else "[]"
+            parsed = json.loads(last_line)
+            if isinstance(parsed, str):
+                paths = [parsed] if parsed else []
+            elif isinstance(parsed, list):
+                paths = [str(p) for p in parsed if str(p).strip()]
+            else:
+                paths = []
+            return {"ok": True, "cancelled": len(paths) == 0, "paths": paths}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "cancelled": True, "paths": [], "detail": "选择文件超时，请重试"}
+        except Exception as exc:
+            return {"ok": False, "cancelled": True, "paths": [], "detail": f"无法打开文件选择窗口：{exc}"}
+    finally:
+        _PICK_DIALOG_LOCK.release()
+
+
+def discover_local_model_videos(directory: str | None = None, limit: int = 30) -> dict[str, Any]:
+    """轻量单层扫描预设拍摄目录中的视频文件（绝不做全盘递归扫描），方便新手一键导入现成人物视频。"""
+    search_dirs: list[tuple[str, Path]] = []
+    cleaned = clean_local_path(directory)
+    if cleaned:
+        p = Path(cleaned)
+        if p.is_dir():
+            search_dirs.append((p.name or str(p), p))
+    else:
+        delivery = resolve_delivery_root()
+        for label, sub in [("拍摄的视频", delivery / "拍摄的视频"), ("底模视频", delivery / "底模视频")]:
+            if sub.is_dir():
+                search_dirs.append((label, sub))
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for label, folder in search_dirs:
+        try:
+            for entry in folder.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.suffix.lower() not in VIDEO_EXTS:
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                if st.st_size <= 0:
+                    continue
+                norm_key = str(entry.resolve()).lower()
+                if norm_key in seen:
+                    continue
+                seen.add(norm_key)
+                items.append(
+                    {
+                        "name": entry.stem,
+                        "filename": entry.name,
+                        "path": str(entry),
+                        "size_mb": round(st.st_size / (1024 * 1024), 1),
+                        "mtime_ms": int(st.st_mtime * 1000),
+                        "folder_label": label,
+                    }
+                )
+        except OSError:
+            continue
+
+    items.sort(key=lambda x: x["mtime_ms"], reverse=True)
+    return {
+        "items": items[:limit],
+        "scanned_dirs": [str(p) for _, p in search_dirs],
+    }
+
+
+def copy_file_to_clipboard(target_path: str) -> tuple[bool, str]:
+    """将本机文件本体放入 Windows 系统剪贴板，用户可直接去微信/桌面/剪映按 Ctrl+V 粘贴（0秒免下载）。"""
+    if os.name != "nt":
+        return False, "当前服务器非 Windows 桌面环境，无法直接复制到本机剪贴板"
+    cleaned = clean_local_path(target_path)
+    if not cleaned:
+        return False, "文件路径为空"
+    p = Path(cleaned)
+    if not p.is_file():
+        return False, f"视频文件不存在：{p}"
+
+    env = os.environ.copy()
+    env["HEYGEM_CLIP_PATH"] = str(p.resolve())
+    try:
+        res = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                "Set-Clipboard -LiteralPath $env:HEYGEM_CLIP_PATH",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()[:200]
+            return False, f"写入系统剪贴板失败：{err or '未知错误'}"
+        return True, f"已复制「{p.name}」到剪贴板，去微信、桌面或剪映直接按 Ctrl+V 粘贴即可"
+    except Exception as exc:
+        return False, f"复制文件失败：{exc}"

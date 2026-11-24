@@ -3,160 +3,411 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HeyGem Studio · 数字人 & IndexTTS2 一体化创作中心</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%234f7cff'/%3E%3Ctext x='50%25' y='55%25' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='32' font-family='sans-serif' font-weight='bold'%3ES%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <title>HeyGem Studio · 数字人一体化工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%233b82f6'/%3E%3Cstop offset='100%25' stop-color='%236366f1'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M22 20h6v10h8V20h6v24h-6V35h-8v9h-6z' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/styles.css?v=2.2" />
 </head>
 <body>
 <div class="app-shell">
-  <!-- 顶部全局健康状态与控制栏 -->
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-badge">STUDIO</span>
-      <span>数字人一体化工作台</span>
+  <div class="sidebar-backdrop hidden" id="sidebarBackdrop" onclick="closeMobileSidebar()"></div>
+  <!-- 左侧系统主导航栏 -->
+  <aside class="sidebar" id="appSidebar">
+    <div class="sidebar-brand">
+      <div class="brand-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-title">HeyGem Studio</div>
+        <div class="brand-sub">数字人一体化工作台</div>
+      </div>
     </div>
 
-    <div class="health-pills" id="healthPills">
-      <div class="pill"><span class="dot" id="dotDocker"></span><span id="txtDocker">渲染引擎 检测中</span></div>
-      <div class="pill"><span class="dot" id="dotTts"></span><span id="txtTts">IndexTTS2 检测中</span></div>
-      <div class="pill"><span class="dot" id="dotQueue"></span><span id="txtQueue">后台队列 检测中</span></div>
-      <div class="pill" id="pillGpu">🎮 GPU 检测中</div>
-      <div class="pill" id="pillDisk">💾 磁盘 检测中</div>
-    </div>
-
-    <div class="topbar-actions">
-      <button class="btn btn-sm btn-primary" id="btnStartAll" onclick="handleStartAll()">▶ 一键启动服务</button>
-      <button class="btn btn-sm btn-warning" id="btnRecover" onclick="handleRecover(false)">🩺 自愈恢复</button>
-      <button class="btn btn-sm" id="btnPauseResume" onclick="handleTogglePause()">⏸ 暂停队列</button>
-      <button class="btn btn-sm" onclick="openLogsModal()">📜 实时日志</button>
-    </div>
-  </header>
-
-  <!-- 实时故障/告警横幅（绝不隐瞒报错） -->
-  <div class="alert-strip hidden" id="alertStrip">
-    <div class="alert-list" id="alertList"></div>
-    <div class="flex-row">
-      <button class="btn btn-sm btn-primary hidden" id="btnAlertReconnect" onclick="refreshAll(false, true)">🔄 立即重连</button>
-      <button class="btn btn-sm btn-primary" id="btnAlertRecover" onclick="handleRecover(false)">立即一键修复</button>
-      <button class="btn btn-sm" id="btnAlertModels" onclick="switchView('models')">去检查模特底模</button>
-    </div>
-  </div>
-
-  <div class="workspace">
-    <!-- 左侧导航 -->
-    <nav class="sidebar">
+    <nav class="sidebar-nav" aria-label="主导航">
+      <div class="nav-group-label">创作中心</div>
       <button class="nav-btn active" data-view="create" onclick="switchView('create')">
-        <span>🎬 快速创作</span>
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="15" height="16" rx="2.5"></rect><path d="m17 10 5-3v10l-5-3"></path></svg>
+          <span>数字人制作</span>
+        </span>
       </button>
+      <button class="nav-btn" data-view="voice" onclick="switchView('voice')">
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+          <span>语音合成台</span>
+        </span>
+        <span class="nav-tag">TTS2</span>
+      </button>
+
+      <div class="nav-group-label">生产与资产</div>
       <button class="nav-btn" data-view="tasks" onclick="switchView('tasks')">
-        <span>📊 任务监控</span>
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+          <span>任务与进度</span>
+        </span>
         <span class="nav-count" id="navActiveCount">0</span>
       </button>
       <button class="nav-btn" data-view="library" onclick="switchView('library')">
-        <span>🗂️ 作品与音频库</span>
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path></svg>
+          <span>成品作品库</span>
+        </span>
         <span class="nav-count" id="navSuccessCount">0</span>
       </button>
+      <button class="nav-btn" data-view="cloudsync" onclick="switchView('cloudsync')">
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"></path><path d="M12 12v6"></path><path d="m9 15 3 3 3-3"></path></svg>
+          <span>云端自动同步</span>
+        </span>
+        <span class="nav-tag" id="navCloudSyncBadge">未开</span>
+      </button>
       <button class="nav-btn" data-view="models" onclick="switchView('models')">
-        <span>👤 模特与音色</span>
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+          <span>人物与声音</span>
+        </span>
         <span class="nav-count" id="navModelCount">0</span>
       </button>
-      <button class="nav-btn" data-view="api" onclick="switchView('api')">
-        <span>🤖 自动化 AI 接口</span>
-      </button>
 
-      <div class="sidebar-footer">
-        <div>接口地址: <code id="studioEndpointHost">检测中...</code></div>
-        <div><a href="/docs" target="_blank" style="color:#93c5fd;text-decoration:none;">📖 打开 Swagger API 文档 ↗</a></div>
-        <button class="btn btn-sm btn-danger" style="width:100%;margin-top:4px;" onclick="handleStopServices()">⏹ 停止后台服务</button>
-      </div>
+      <div class="nav-group-label">系统运维</div>
+      <button class="nav-btn" data-view="system" onclick="switchView('system')">
+        <span class="nav-left">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"></rect><rect x="2" y="14" width="20" height="7" rx="2"></rect><line x1="6" y1="6.5" x2="6.01" y2="6.5"></line><line x1="6" y1="17.5" x2="6.01" y2="17.5"></line></svg>
+          <span>系统与服务</span>
+        </span>
+      </button>
     </nav>
 
-    <!-- 主内容区 -->
-    <main class="content">
-      <!-- ==================== 视图 1：快速创作 ==================== -->
-      <section class="view active" id="view-create">
-        <div class="create-grid">
-          <!-- 左列：选择数字人模特 -->
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">1. 选择数字人形象</h3>
-              <button class="btn btn-sm btn-primary" onclick="openAddModelModal()">+ 导入模特</button>
+    <!-- 侧边栏底部迷你运行态势卡 -->
+    <div class="sidebar-footer">
+      <button class="sys-mini-card" id="sidebarStatusCard" onclick="switchView('system')" title="点击查看引擎状态、本机与局域网访问地址及日志">
+        <div class="sys-mini-top">
+          <span class="sys-mini-title">
+            <span class="dot" id="sideDotOverall"></span>
+            <span id="sideStatusLabel">检测引擎中...</span>
+          </span>
+          <span class="sys-mini-mode" id="sideClientMode">本机</span>
+        </div>
+        <div class="sys-mini-lamps">
+          <span><i class="dot" id="sideDotDocker"></i>渲染</span>
+          <span><i class="dot" id="sideDotTts"></i>语音</span>
+          <span><i class="dot" id="sideDotQueue"></i>队列</span>
+        </div>
+        <div class="sys-mini-sub" id="sideGpuBrief">等待显卡与地址信息...</div>
+      </button>
+    </div>
+  </aside>
+
+  <!-- 右侧主系统框架 -->
+  <div class="app-main">
+    <!-- 顶部统一视图标题栏 -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="btn btn-sm mobile-menu-btn" id="btnMobileMenu" onclick="toggleMobileSidebar()" aria-label="展开导航菜单">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
+        <h1 class="page-title" id="pageTitle">数字人制作</h1>
+        <span class="page-subtitle" id="pageSubtitle">选定人物、输入文案或上传录音，一站式对口型生成成片</span>
+      </div>
+      <div class="topbar-right">
+        <button class="status-chip" id="topStatusChip" onclick="switchView('system')" title="点击前往「系统与服务」管理引擎与访问地址">
+          <span class="dot" id="topStatusDot"></span>
+          <span id="topStatusText">检测服务状态...</span>
+        </button>
+        <button class="btn btn-sm" id="btnTopQuickRefresh" onclick="refreshAll(false, true)" title="刷新全部数据与引擎状态">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></svg>
+          <span>刷新</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- 仅在关键后台服务未启动/暂停/断连时出现的单行提示条 -->
+    <div class="alert-strip hidden" id="alertStrip">
+      <div class="alert-text" id="alertText"></div>
+      <div class="flex-row">
+        <button class="btn btn-sm btn-primary hidden" id="btnAlertReconnect" onclick="refreshAll(false, true)">立即重连</button>
+        <button class="btn btn-sm btn-primary hidden" id="btnAlertStart" onclick="handleStartAll()">一键启动服务</button>
+        <button class="btn btn-sm btn-success hidden" id="btnAlertResume" onclick="handleTogglePause()">恢复队列</button>
+        <button class="btn btn-sm hidden" id="btnAlertRecover" onclick="handleRecover(false)">自愈修复</button>
+      </div>
+    </div>
+
+    <!-- 主内容视口 -->
+    <main class="content" id="mainContent">
+
+      <!-- ==================== 视图 1：数字人制作（桌面三栏工作台） ==================== -->
+      <section class="view view-workspace active" id="view-create">
+        <div class="studio-grid">
+          <!-- 左栏：人物底模选择器 -->
+          <div class="pane pane-models">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <span class="pane-step">1</span>
+                <span class="pane-title">选择人物</span>
+                <span class="pill-count" id="createModelCountBadge">0</span>
+              </div>
+              <button class="btn btn-xs btn-primary" id="btnQuickPickVideo" onclick="handleQuickAddModelClick()">+ 添加</button>
             </div>
-            <div class="two-col mb-8">
-              <select class="select" id="createModelGroupFilter" onchange="renderCreateModelList()">
+
+            <div class="pane-toolbar" id="createModelFilterBar">
+              <input class="input input-sm" id="createModelSearch" placeholder="搜索人物..." oninput="renderCreateModelList()" />
+              <select class="select select-sm" id="createModelGroupFilter" style="width:108px;flex-shrink:0;" onchange="renderCreateModelList()">
                 <option value="all">全部分组</option>
               </select>
-              <input class="input" id="createModelSearch" placeholder="搜索模特..." oninput="renderCreateModelList()" />
             </div>
-            <div class="model-list" id="createModelList"></div>
+
+            <div id="step1ImportingBanner" class="importing-banner hidden"></div>
+            <input type="file" id="quickUploadVideoInput" accept="video/*" style="display:none;" onchange="handleQuickUploadModelFile(this.files?.[0])" />
+
+            <div class="pane-scroll" id="createModelScroll">
+              <div id="createModelList"></div>
+              <div id="createDiscoverCompact"></div>
+              <div id="createMissingBanner" class="hidden"></div>
+            </div>
           </div>
 
-          <!-- 中列：融合配音 / 导入音频 工作台 -->
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">2. 配音调控与视频生成</h3>
-              <div class="segmented" id="createModeTabs">
-                <button class="active" data-mode="tts" onclick="setCreateMode('tts')">🎙 IndexTTS2 文本配音</button>
-                <button data-mode="audio" onclick="setCreateMode('audio')">📁 导入音频直驱</button>
-              </div>
-            </div>
+          <!-- 中栏：人物舞台 + 口播内容编辑区 -->
+          <div class="pane pane-stage">
+            <!-- 动态实时制作监控条（仅在进行中/刚完成/刚失败时浮现） -->
+            <div id="liveMonitorPanel" class="live-banner-wrap hidden"></div>
 
-            <!-- 通用：标题与分类 -->
-            <div class="two-col">
-              <div class="field">
-                <label>作品标题（留空则自动命名）</label>
-                <input class="input" id="jobNameInput" placeholder="例如：春季农资新品口播第1条" />
-              </div>
-              <div class="field">
-                <label>作品归档分类</label>
-                <select class="select" id="jobCategorySelect"></select>
-              </div>
-            </div>
+            <!-- 当前选中人物舞台卡 / 无人物时的零门槛引导 -->
+            <div id="selectedModelStage" class="stage-hero-card"></div>
 
-            <!-- 模式 A：IndexTTS2 全参文本配音 -->
-            <div id="createModeTts">
-              <div class="field">
-                <label>
-                  <span>参考音色（默认自动跟随所选数字人，也可自由换声）</span>
-                  <button class="btn btn-sm" onclick="openUploadVoiceModal()">+ 上传新音色</button>
-                </label>
-                <div class="flex-row">
-                  <select class="select" id="ttsVoiceSelect" style="flex:1;" onchange="updateVoicePreview()"></select>
+            <!-- 第 2 步：文案配音 / 已有录音 主创作区 -->
+            <div class="stage-editor-card">
+              <div class="pane-head" style="border-bottom:1px solid var(--border);padding:12px 16px;">
+                <div class="pane-title-group">
+                  <span class="pane-step">2</span>
+                  <span class="pane-title">让人物说什么</span>
                 </div>
-                <audio id="voiceRefPreview" controls class="mt-8 hidden"></audio>
+                <div class="segmented" id="createModeTabs">
+                  <button class="active" data-mode="tts" onclick="setCreateMode('tts')">写文案配音</button>
+                  <button data-mode="audio" onclick="setCreateMode('audio')">用已有录音</button>
+                </div>
               </div>
 
-              <div class="field">
-                <label>
-                  <span>口播文案</span>
-                  <span id="textStats" class="section-sub">0 字 · 预计约 0 秒</span>
-                </label>
-                <textarea class="textarea" id="ttsTextInput" placeholder="输入或粘贴口播文案，支持长文案自动按句分段合成..." oninput="updateTextStats()"></textarea>
-              </div>
-
-              <!-- IndexTTS2 参数与预设控制面板 -->
-              <div class="card" style="background:var(--bg-elev);padding:12px;margin-bottom:12px;">
-                <div class="flex-between mb-8">
-                  <strong style="font-size:13.5px;">🎛️ IndexTTS2 语音深度调控</strong>
+              <!-- 模式 A：写文案配音 -->
+              <div class="stage-editor-body" id="createModeTts">
+                <div class="editor-meta-row">
+                  <span class="section-sub">输入口播文稿（支持长文案，后台自动分段配音并对口型）</span>
                   <div class="flex-row">
-                    <select class="select" id="ttsPresetSelect" style="width:180px;" onchange="applySelectedPreset()"></select>
-                    <button class="btn btn-sm" onclick="saveCurrentAsPreset()">💾 存为预设</button>
-                    <button class="btn btn-sm btn-danger" id="btnDeletePreset" title="删除当前选中的参数预设" onclick="deleteSelectedPreset()">🗑 删预设</button>
-                    <button class="btn btn-sm" onclick="saveAsGlobalTtsConfig()">设默认</button>
+                    <span id="textStats" class="stat-pill">0 字 · 约 0 秒</span>
+                    <button class="btn btn-xs btn-ghost" onclick="clearScriptInput()">清空</button>
                   </div>
+                </div>
+                <textarea class="textarea script-textarea" id="ttsTextInput" placeholder="把你要让数字人说的话粘贴到这里……&#10;&#10;提示：右侧可直接选声音、套用风格预设或调语速；想精细调节 8 维情绪与模型参数，点击右侧「完整调音台 →」即可。" oninput="onScriptInputChanged()"></textarea>
+
+                <!-- 试听配音实时进度 & 试听结果（仅触发试听时显示） -->
+                <div id="ttsLiveBox" class="inline-live-box hidden">
+                  <div class="flex-between mb-6">
+                    <span id="ttsLiveMsg" class="text-accent" style="font-weight:600;font-size:13px;">正在合成试听声音...</span>
+                    <button class="btn btn-xs btn-danger" id="btnCancelTts" onclick="handleCancelTts()">中断配音</button>
+                  </div>
+                  <div class="progress-track"><div class="progress-fill" id="ttsLiveBar" style="width:10%;"></div></div>
+                </div>
+
+                <div id="ttsAuditionResult" class="inline-done-box hidden">
+                  <div class="flex-between mb-6">
+                    <strong style="color:#6ee7b7;font-size:13px;">试听音频已生成：<span id="auditionTitle"></span></strong>
+                    <div class="flex-row">
+                      <a class="btn btn-xs" id="auditionDownload" download>下载音频</a>
+                      <button class="btn btn-xs btn-success" id="btnAuditionToVideo" onclick="createVideoFromAudition()">满意，用这段声音做视频</button>
+                    </div>
+                  </div>
+                  <audio id="auditionPlayer" controls></audio>
+                </div>
+              </div>
+
+              <!-- 模式 B：用已有录音（支持多选批量） -->
+              <div class="stage-editor-body hidden" id="createModeAudio">
+                <div class="dropzone-compact" id="audioDropzone">
+                  <div class="flex-between">
+                    <div>
+                      <div style="font-weight:600;font-size:13.5px;">拖入或选择录好的音频（WAV / MP3 / M4A / FLAC）</div>
+                      <div class="section-sub">可一次勾选多条音频，批量生成多条数字人视频</div>
+                    </div>
+                    <div class="flex-row">
+                      <button class="btn btn-sm btn-primary" id="btnPickLocalAudios" onclick="event.stopPropagation();pickAndImportLocalAudios()">从电脑选录音</button>
+                      <button class="btn btn-sm" onclick="event.stopPropagation();document.getElementById('batchAudioInput').click()">网页上传</button>
+                    </div>
+                  </div>
+                  <input type="file" id="batchAudioInput" accept="audio/*" multiple style="display:none;" onchange="handleUploadBatchAudios(this.files)" />
+                </div>
+
+                <div class="flex-between" style="margin-top:10px;margin-bottom:6px;">
+                  <strong style="font-size:13px;">勾选要做成视频的音频</strong>
+                  <span class="stat-pill" id="selectedAudioCount">已选 0 条</span>
+                </div>
+                <div id="createAudioLibraryList" class="audio-pick-list"></div>
+
+                <details class="adv-box" style="margin-top:8px;">
+                  <summary id="summaryLocalAudioPaths">粘贴本机音频路径批量导入（可选）</summary>
+                  <div class="flex-row mt-8" style="align-items:stretch;">
+                    <textarea class="textarea" id="localAudioPathInput" style="flex:1;min-height:46px;height:46px;" placeholder="每行一条本机音频路径，例如：E:\录音\口播1.wav" oninput="updateWizardIndicators()"></textarea>
+                    <button class="btn btn-sm btn-primary" id="btnImportLocalAudio" onclick="handleImportLocalAudioPaths()">导入并勾选</button>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </div>
+
+          <!-- 右栏：配音参数 & 输出设置 + 底部固定生成行动栏 -->
+          <div class="pane pane-inspector">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <span class="pane-step">3</span>
+                <span class="pane-title">配音与输出</span>
+              </div>
+              <button class="btn btn-xs btn-ghost text-accent" onclick="openVoiceStudioFromCreate()">完整调音台 →</button>
+            </div>
+
+            <div class="pane-scroll inspector-body">
+              <!-- 配音配置区块（写文案模式显示） -->
+              <div id="createVoiceInspector">
+                <div class="inspector-section">
+                  <div class="inspector-label-row">
+                    <label for="ttsVoiceSelect">配音声音</label>
+                    <div class="flex-row" style="gap:4px;">
+                      <button class="btn btn-xs" id="btnToggleVoicePreview" onclick="toggleVoicePreviewPlayer()">试听原声</button>
+                      <button class="btn btn-xs" id="btnUploadVoiceQuick" onclick="openUploadVoiceModal()">+ 上传</button>
+                    </div>
+                  </div>
+                  <div class="voice-select-wrap" id="voiceBar">
+                    <select class="select" id="ttsVoiceSelect" onchange="onCreateVoiceSelectChanged()"></select>
+                  </div>
+                  <div id="voicePreviewWrap" class="hidden mt-8">
+                    <audio id="voiceRefPreview" controls></audio>
+                  </div>
+                </div>
+
+                <div class="inspector-section">
+                  <div class="inspector-label-row">
+                    <label for="createPresetSelect">配音风格预设</label>
+                    <span class="section-sub" id="createTuneBadge">标准 · 1.00x</span>
+                  </div>
+                  <select class="select" id="createPresetSelect" onchange="applyPresetById(this.value)"></select>
+
+                  <div class="field mt-10" style="margin-bottom:8px;">
+                    <label><span>语速</span><span id="createValSpeed" class="mono-num">1.00x</span></label>
+                    <input type="range" id="createSpeedRange" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromCreate(this.value)" />
+                  </div>
+
+                  <div class="field" style="margin-bottom:4px;">
+                    <label><span>情感模式</span><button class="link-btn" onclick="openVoiceStudioFromCreate()">精细调 8 维情感 →</button></label>
+                    <div class="segmented segmented-full" id="createEmoModeTabs">
+                      <button class="active" data-emo="same_as_speaker" onclick="setEmoMode('same_as_speaker')">原声</button>
+                      <button data-emo="emo_vector" onclick="setEmoMode('emo_vector')">8维</button>
+                      <button data-emo="emo_audio" onclick="setEmoMode('emo_audio')">参考音</button>
+                      <button data-emo="emo_text" onclick="setEmoMode('emo_text')">描述词</button>
+                    </div>
+                  </div>
+                  <div id="createEmoHint" class="section-sub mt-6"></div>
+                </div>
+              </div>
+
+              <!-- 通用成片输出设置 -->
+              <div class="inspector-section">
+                <div class="field" style="margin-bottom:10px;">
+                  <label for="jobNameInput">成片标题（选填，留空自动命名）</label>
+                  <input class="input" id="jobNameInput" placeholder="例如：春季新品介绍第1条" />
+                </div>
+                <div class="field" style="margin-bottom:0;">
+                  <div class="inspector-label-row">
+                    <label for="jobCategorySelect">保存到分类</label>
+                    <button class="link-btn" onclick="promptNewCategory()">+ 新建分类</button>
+                  </div>
+                  <select class="select" id="jobCategorySelect"></select>
+                </div>
+              </div>
+            </div>
+
+            <!-- 底部固定行动区（绝不滚出视野） -->
+            <div class="inspector-footer">
+              <div class="ready-summary" id="wizardReadyHint">请先在左侧选择一位人物</div>
+              <div class="action-stack" id="actionBtnsTts">
+                <button class="btn btn-primary btn-block btn-lg" id="btnSubmitTtsVideo" onclick="handleSubmitTtsVideo()">开始制作数字人视频</button>
+                <button class="btn btn-block" id="btnSynthesizeTts" onclick="handleSynthesizeTts()">先试听配音效果</button>
+              </div>
+              <div class="action-stack hidden" id="actionBtnsAudio">
+                <button class="btn btn-primary btn-block btn-lg" id="btnBatchCreateAudios" onclick="handleBatchCreateFromAudios()">开始制作数字人视频</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 视图 2：IndexTTS-2 独立语音合成台 ==================== -->
+      <section class="view view-workspace" id="view-voice">
+        <div class="voice-studio-grid">
+          <!-- 左栏：完整 IndexTTS-2 可视化调音主控 -->
+          <div class="pane pane-voice-main">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <span class="pane-title">IndexTTS-2 语音调音台</span>
+                <span class="badge badge-info" id="voiceEngineBadge">IndexTTS-2</span>
+              </div>
+              <div class="flex-row">
+                <select class="select select-sm" id="ttsPresetSelect" style="width:176px;" onchange="applySelectedPreset()"></select>
+                <button class="btn btn-xs" onclick="saveCurrentAsPreset()">存为预设</button>
+                <button class="btn btn-xs btn-danger" id="btnDeletePreset" onclick="deleteSelectedPreset()">删预设</button>
+                <button class="btn btn-xs" onclick="saveAsGlobalTtsConfig()">设为默认</button>
+              </div>
+            </div>
+
+            <div class="pane-scroll voice-controls-body">
+              <!-- 文案与音色 -->
+              <div class="panel-block">
+                <div class="flex-between mb-6">
+                  <strong style="font-size:13.5px;">配音文案</strong>
+                  <span id="voiceTextStats" class="stat-pill">0 字 · 约 0 秒</span>
+                </div>
+                <textarea class="textarea" id="voiceTextInput" style="min-height:112px;" placeholder="输入要合成语音的文本（与「数字人制作」的文案自动双向同步）……" oninput="onVoiceTextInputChanged()"></textarea>
+
+                <div class="two-col mt-10">
+                  <div class="field" style="margin-bottom:0;">
+                    <label>参考声音</label>
+                    <div class="flex-row" style="flex-wrap:nowrap;">
+                      <select class="select" id="voiceStudioVoiceSelect" style="flex:1;" onchange="onVoiceStudioVoiceChanged()"></select>
+                      <button class="btn btn-sm" id="btnVoiceStudioPlayRef" onclick="toggleVoiceStudioRefPlayer()">试听</button>
+                      <button class="btn btn-sm" onclick="openUploadVoiceModal()">+ 上传</button>
+                    </div>
+                  </div>
+                  <div class="two-col" style="gap:8px;">
+                    <div class="field" style="margin-bottom:0;">
+                      <label>音频名称（选填）</label>
+                      <input class="input" id="voiceAssetNameInput" placeholder="留空自动命名" />
+                    </div>
+                    <div class="field" style="margin-bottom:0;">
+                      <label>归属分类</label>
+                      <select class="select" id="voiceCategorySelect"></select>
+                    </div>
+                  </div>
+                </div>
+                <div id="voiceStudioRefWrap" class="hidden mt-8">
+                  <audio id="voiceStudioRefPlayer" controls></audio>
+                </div>
+              </div>
+
+              <!-- 引擎与情感调控 -->
+              <div class="panel-block">
+                <div class="flex-between mb-8">
+                  <strong style="font-size:13.5px;">引擎与情感控制</strong>
+                  <span class="section-sub" id="ttsTuneSummary">语速 1.00x · 跟随原声</span>
                 </div>
 
                 <div class="three-col">
                   <div class="field">
-                    <label>模型版本</label>
+                    <label>语音引擎版本</label>
                     <select class="select" id="ttsModelVersion" onchange="onTtsModelVersionChange()">
-                      <option value="IndexTTS-2">IndexTTS-2 (经典)</option>
+                      <option value="IndexTTS-2">IndexTTS-2 (经典稳定)</option>
                       <option value="IndexTTS-2.5">IndexTTS-2.5 (多语变速)</option>
                     </select>
                   </div>
                   <div class="field" id="ttsLangField">
-                    <label>语言（2.5 生效）</label>
-                    <select class="select" id="ttsLang">
+                    <label>目标语言（2.5 生效）</label>
+                    <select class="select" id="ttsLang" onchange="syncTuneSummaryAll()">
                       <option value="ZH">中文 (ZH)</option>
                       <option value="EN">英文 (EN)</option>
                       <option value="JA">日语 (JA)</option>
@@ -165,292 +416,448 @@
                     </select>
                   </div>
                   <div class="field">
-                    <label><span>语速</span><span id="valSpeed">1.00x</span></label>
-                    <input type="range" id="ttsSpeed" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncRangeVal('ttsSpeed','valSpeed','x')" />
+                    <label><span>语速</span><span id="valSpeed" class="mono-num">1.00x</span></label>
+                    <input type="range" id="ttsSpeed" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromVoiceStudio(this.value)" />
                   </div>
                 </div>
 
-                <!-- 情感控制 -->
                 <div class="field" style="margin-bottom:8px;">
-                  <label>情感控制模式</label>
+                  <label>情感风格模式</label>
                   <div class="segmented" id="emoModeTabs">
-                    <button class="active" data-emo="same_as_speaker" onclick="setEmoMode('same_as_speaker')">跟随参考音</button>
+                    <button class="active" data-emo="same_as_speaker" onclick="setEmoMode('same_as_speaker')">跟随原声</button>
                     <button data-emo="emo_vector" onclick="setEmoMode('emo_vector')">8维情感滑块</button>
                     <button data-emo="emo_audio" onclick="setEmoMode('emo_audio')">情感参考音频</button>
-                    <button data-emo="emo_text" onclick="setEmoMode('emo_text')">自然语言情感</button>
+                    <button data-emo="emo_text" onclick="setEmoMode('emo_text')">自然语言描述</button>
                   </div>
                 </div>
 
                 <div id="emoAlphaWrap" class="field hidden" style="margin-bottom:8px;">
-                  <label><span>情感影响强度 (emo_alpha)</span><span id="valEmoAlpha">0.65</span></label>
-                  <input type="range" id="ttsEmoAlpha" min="0" max="1" step="0.05" value="0.65" oninput="syncRangeVal('ttsEmoAlpha','valEmoAlpha','')" />
+                  <label><span>情感强度</span><span id="valEmoAlpha" class="mono-num">0.65</span></label>
+                  <input type="range" id="ttsEmoAlpha" min="0" max="1" step="0.05" value="0.65" oninput="syncRangeVal('ttsEmoAlpha','valEmoAlpha','');syncTuneSummaryAll()" />
                 </div>
 
                 <div id="emoVectorBox" class="emo-grid hidden"></div>
-                <div id="emoSumHint" class="section-sub hidden mt-8" style="font-size:11.5px;"></div>
+                <div id="emoSumHint" class="section-sub hidden mt-6" style="font-size:12px;"></div>
 
                 <div id="emoAudioBox" class="field hidden mt-8">
-                  <label>情感参考音频（上传一段带目标情绪的声音）</label>
+                  <label>情感参考音频（选择或上传带目标情绪的一段人声）</label>
                   <div class="flex-row">
-                    <input class="input" id="ttsEmoAudioPath" placeholder="点击右侧上传音频或粘贴本地路径" style="flex:1;" />
+                    <input class="input" id="ttsEmoAudioPath" placeholder="选择或上传情感音频路径" style="flex:1;" oninput="syncTuneSummaryAll()" />
+                    <button class="btn btn-sm" id="btnPickEmoAudioLocal" onclick="pickEmoAudioFile()">选本机音频</button>
                     <label class="btn btn-sm" style="cursor:pointer;">
-                      上传情感音
-                      <input type="file" accept="audio/*" style="display:none;" onchange="uploadEmoAudio(this)" />
+                      网页上传
+                      <input type="file" id="emoAudioFileInput" accept="audio/*" style="display:none;" onchange="uploadEmoAudio(this)" />
                     </label>
                   </div>
                 </div>
 
                 <div id="emoTextBox" class="field hidden mt-8">
-                  <label>情感描述文本（启用 Qwen 情感推理，如：激情饱满、真诚温和）</label>
-                  <input class="input" id="ttsEmoText" placeholder="例如：充满热情、语调上扬地推荐这款产品" />
+                  <label>情感描述词（例如：激情饱满、真诚温和、语调上扬）</label>
+                  <input class="input" id="ttsEmoText" placeholder="例如：充满热情、娓娓道来地介绍产品亮点" oninput="syncTuneSummaryAll()" />
                 </div>
 
-                <!-- 高级参数折叠 -->
-                <details class="adv-box">
-                  <summary>⚙️ 高级推理参数（采样步数 / 束搜索 / 温度 / 重复惩罚 / 分段长度）</summary>
+                <!-- 底层推理高级参数（可折叠） -->
+                <details class="adv-box mt-10" id="voiceAdvDetails">
+                  <summary>底层推理参数微调（扩散步数 / 采样温度 / 分段策略）</summary>
                   <div class="three-col mt-12">
                     <div class="field">
-                      <label><span>扩散步数 (diffusion_steps)</span><span id="valSteps">25</span></label>
+                      <label><span>扩散步数</span><span id="valSteps" class="mono-num">25</span></label>
                       <input type="range" id="ttsSteps" min="8" max="45" step="1" value="25" oninput="syncRangeVal('ttsSteps','valSteps','')" />
                     </div>
                     <div class="field">
-                      <label><span>束搜索 (num_beams)</span><span id="valBeams">3</span></label>
+                      <label><span>束搜索 (Beams)</span><span id="valBeams" class="mono-num">3</span></label>
                       <input type="range" id="ttsBeams" min="1" max="5" step="1" value="3" oninput="syncRangeVal('ttsBeams','valBeams','')" />
                     </div>
                     <div class="field">
-                      <label><span>句间停顿 (ms)</span><span id="valSilence">200ms</span></label>
+                      <label><span>句间停顿</span><span id="valSilence" class="mono-num">200ms</span></label>
                       <input type="range" id="ttsSilence" min="0" max="800" step="20" value="200" oninput="syncRangeVal('ttsSilence','valSilence','ms')" />
                     </div>
                     <div class="field">
-                      <label><span>温度 (temperature)</span><span id="valTemp">0.80</span></label>
+                      <label><span>温度 (Temp)</span><span id="valTemp" class="mono-num">0.80</span></label>
                       <input type="range" id="ttsTemp" min="0.1" max="1.5" step="0.05" value="0.8" oninput="syncRangeVal('ttsTemp','valTemp','')" />
                     </div>
                     <div class="field">
-                      <label><span>Top-P</span><span id="valTopP">0.80</span></label>
+                      <label><span>Top-P</span><span id="valTopP" class="mono-num">0.80</span></label>
                       <input type="range" id="ttsTopP" min="0.1" max="1.0" step="0.05" value="0.8" oninput="syncRangeVal('ttsTopP','valTopP','')" />
                     </div>
                     <div class="field">
-                      <label><span>Top-K</span><span id="valTopK">30</span></label>
+                      <label><span>Top-K</span><span id="valTopK" class="mono-num">30</span></label>
                       <input type="range" id="ttsTopK" min="1" max="100" step="1" value="30" oninput="syncRangeVal('ttsTopK','valTopK','')" />
                     </div>
                     <div class="field">
-                      <label><span>重复惩罚</span><span id="valRep">10.0</span></label>
+                      <label><span>重复惩罚</span><span id="valRep" class="mono-num">10.0</span></label>
                       <input type="range" id="ttsRep" min="1" max="15" step="0.5" value="10" oninput="syncRangeVal('ttsRep','valRep','')" />
                     </div>
                     <div class="field">
-                      <label><span>分段字数上限</span><span id="valChunk">180</span></label>
+                      <label><span>分段字数上限</span><span id="valChunk" class="mono-num">180</span></label>
                       <input type="range" id="ttsChunk" min="60" max="320" step="10" value="180" oninput="syncRangeVal('ttsChunk','valChunk','')" />
                     </div>
                     <div class="field">
-                      <label>长文自动加速</label>
-                      <label style="flex-direction:row;gap:8px;cursor:pointer;color:var(--text);">
-                        <input type="checkbox" id="ttsAutoFast" /> 超过450字自动降步提速
+                      <label>长文自动提速</label>
+                      <label style="flex-direction:row;gap:8px;cursor:pointer;color:var(--text);padding-top:4px;">
+                        <input type="checkbox" id="ttsAutoFast" /> 超过 450 字提速
                       </label>
                     </div>
                   </div>
                 </details>
               </div>
-
-              <!-- 实时试听区 -->
-              <div id="ttsLiveBox" class="card hidden" style="background:var(--bg-input);padding:12px;margin-bottom:12px;">
-                <div class="flex-between mb-8">
-                  <span id="ttsLiveMsg" style="font-weight:600;color:#93c5fd;">正在合成试听音频...</span>
-                  <button class="btn btn-sm btn-danger" id="btnCancelTts" onclick="handleCancelTts()">⏹ 中断配音</button>
-                </div>
-                <div class="progress-track"><div class="progress-fill" id="ttsLiveBar" style="width:10%;"></div></div>
-              </div>
-
-              <div id="ttsAuditionResult" class="card hidden" style="background:rgba(16,185,129,0.08);border-color:rgba(16,185,129,0.4);padding:12px;margin-bottom:12px;">
-                <div class="flex-between mb-8">
-                  <strong style="color:#6ee7b7;">✅ 试听音频已生成：<span id="auditionTitle"></span></strong>
-                  <div class="flex-row">
-                    <a class="btn btn-sm" id="auditionDownload" download>⬇ 下载 WAV</a>
-                    <button class="btn btn-sm btn-success" id="btnAuditionToVideo" onclick="createVideoFromAudition()">🎬 用此音频生成数字人视频</button>
-                  </div>
-                </div>
-                <audio id="auditionPlayer" controls></audio>
-              </div>
-
-              <div class="flex-row">
-                <button class="btn btn-lg" id="btnSynthesizeTts" onclick="handleSynthesizeTts()">🔊 先合成试听音频</button>
-                <button class="btn btn-lg btn-primary" style="flex:1;" id="btnSubmitTtsVideo" onclick="handleSubmitTtsVideo()">🚀 一键直出数字人视频</button>
-              </div>
             </div>
 
-            <!-- 模式 B：导入音频直驱（支持多文件批量） -->
-            <div id="createModeAudio" class="hidden">
-              <div class="dropzone" id="audioDropzone" onclick="document.getElementById('batchAudioInput').click()">
-                <div style="font-size:26px;margin-bottom:6px;">📂</div>
-                <div style="font-weight:600;">点击或拖拽音频文件到此处（支持多选批量导入）</div>
-                <div class="section-sub mt-8">支持 WAV / MP3 / M4A / FLAC / AAC，自动转码为数字人标准音频并保存至音频库</div>
-                <input type="file" id="batchAudioInput" accept="audio/*" multiple style="display:none;" onchange="handleUploadBatchAudios(this.files)" />
-              </div>
-
-              <div class="field mt-12">
-                <label>或粘贴本机音频绝对路径快速导入（自动清洗引号，支持换行粘贴多条）</label>
-                <div class="flex-row" style="align-items:stretch;">
-                  <textarea class="textarea" id="localAudioPathInput" style="flex:1;min-height:46px;height:46px;" placeholder='例如："E:\录音\口播1.wav"（可多行粘贴批量导入）'></textarea>
-                  <button class="btn btn-primary" id="btnImportLocalAudio" onclick="handleImportLocalAudioPaths()">📥 导入并勾选</button>
+            <!-- 底部固定合成控制条 -->
+            <div class="voice-footer">
+              <div id="voiceLiveBox" class="inline-live-box hidden" style="margin-bottom:10px;">
+                <div class="flex-between mb-6">
+                  <span id="voiceLiveMsg" class="text-accent" style="font-weight:600;font-size:13px;">正在合成语音...</span>
+                  <button class="btn btn-xs btn-danger" onclick="handleCancelTts()">中断配音</button>
                 </div>
+                <div class="progress-track"><div class="progress-fill" id="voiceLiveBar" style="width:10%;"></div></div>
               </div>
-
-              <div class="mt-12">
-                <div class="flex-between mb-8">
-                  <strong style="font-size:13.5px;">勾选要用于生成视频的音频（来自音频素材库）</strong>
-                  <span class="section-sub" id="selectedAudioCount">已选 0 条</span>
-                </div>
-                <div id="createAudioLibraryList" style="max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;"></div>
-              </div>
-
-              <div class="mt-12">
-                <button class="btn btn-lg btn-primary" id="btnBatchCreateAudios" style="width:100%;" onclick="handleBatchCreateFromAudios()">🚀 将所选音频一键批量加入数字人生成队列</button>
+              <div class="flex-between">
+                <button class="btn" onclick="switchView('create')">带当前参数返回做数字人</button>
+                <button class="btn btn-primary btn-lg" id="btnVoiceStudioSynthesize" onclick="handleVoiceStudioSynthesize()">合成配音音频</button>
               </div>
             </div>
           </div>
 
-          <!-- 右列：实时运行监控器 -->
-          <div class="card create-right-rail">
-            <div class="card-header">
-              <h3 class="card-title">📡 当前执行监视器</h3>
-              <button class="btn btn-sm" onclick="switchView('tasks')">全部任务 →</button>
+          <!-- 右栏：最新试听成果 + 历史配音资产池 -->
+          <div class="pane pane-voice-side">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <span class="pane-title">已合成音频池</span>
+                <span class="pill-count" id="voiceAudioCountBadge">0</span>
+              </div>
+              <input class="input input-sm" id="voiceHistorySearch" style="width:150px;" placeholder="搜索音频..." oninput="renderVoiceHistoryList()" />
             </div>
-            <div id="liveMonitorPanel">
-              <div class="section-sub">暂无正在执行的任务，提交后将在此实时显示阶段、帧数进度、预计剩余时间与一键中断。</div>
+
+            <div class="pane-scroll voice-side-body">
+              <!-- 最新试听高光卡 -->
+              <div id="voiceLatestCard" class="inline-done-box hidden" style="margin-bottom:12px;">
+                <div class="flex-between mb-6">
+                  <strong style="color:#6ee7b7;font-size:13px;" id="voiceLatestTitle">最新合成音频</strong>
+                </div>
+                <audio id="voiceLatestPlayer" controls class="mb-8"></audio>
+                <div class="flex-row">
+                  <button class="btn btn-xs btn-primary" onclick="useLatestVoiceAssetForVideo()">用这段音频做数字人</button>
+                  <a class="btn btn-xs" id="voiceLatestDownload" download>下载 WAV</a>
+                </div>
+              </div>
+
+              <div id="voiceHistoryList" class="voice-history-list"></div>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- ==================== 视图 2：任务队列与监控 ==================== -->
-      <section class="view" id="view-tasks">
-        <div class="flex-between mb-8">
+      <!-- ==================== 视图 3：任务与进度监控 ==================== -->
+      <section class="view view-scroll" id="view-tasks">
+        <div class="kpi-row" id="tasksKpiRow">
+          <button class="kpi-card active" data-kpi="all" onclick="setTaskFilter('all')">
+            <div class="kpi-label">全部任务</div>
+            <div class="kpi-value" id="kpiTotal">0</div>
+          </button>
+          <button class="kpi-card" data-kpi="active" onclick="setTaskFilter('active')">
+            <div class="kpi-label">制作中 / 排队</div>
+            <div class="kpi-value text-accent" id="kpiActive">0</div>
+          </button>
+          <button class="kpi-card" data-kpi="success" onclick="setTaskFilter('success')">
+            <div class="kpi-label">已完成</div>
+            <div class="kpi-value text-success" id="kpiSuccess">0</div>
+          </button>
+          <button class="kpi-card" data-kpi="failed" onclick="setTaskFilter('failed')">
+            <div class="kpi-label">失败 / 需关注</div>
+            <div class="kpi-value text-danger" id="kpiFailed">0</div>
+          </button>
+        </div>
+
+        <div class="toolbar-bar">
           <div class="segmented" id="taskFilterTabs">
-            <button class="active" data-status="all" onclick="setTaskFilter('all')">全部任务</button>
+            <button class="active" data-status="all" onclick="setTaskFilter('all')">全部</button>
             <button data-status="active" onclick="setTaskFilter('active')">进行中 / 排队</button>
             <button data-status="success" onclick="setTaskFilter('success')">已完成</button>
-            <button data-status="failed" onclick="setTaskFilter('failed')">报错失败</button>
+            <button data-status="failed" onclick="setTaskFilter('failed')">失败</button>
             <button data-status="cancelled" onclick="setTaskFilter('cancelled')">已中断</button>
           </div>
           <div class="flex-row">
-            <input class="input" id="taskSearch" style="width:220px;" placeholder="搜索任务名 / 文案 / 模特..." oninput="renderTasksView()" />
-            <button class="btn btn-sm" onclick="refreshAll()">🔄 刷新</button>
+            <input class="input input-sm" id="taskSearch" style="width:220px;" placeholder="搜索标题 / 文案 / 人物..." oninput="renderTasksView()" />
+            <button class="btn btn-sm" id="btnTasksPauseResume" onclick="handleTogglePause()">暂停队列</button>
+            <button class="btn btn-sm btn-warning" onclick="handleRecover(false)">自愈修复</button>
           </div>
         </div>
+
         <div class="job-list" id="tasksList"></div>
       </section>
 
-      <!-- ==================== 视图 3：作品与音频分类库 ==================== -->
-      <section class="view" id="view-library">
-        <div class="flex-between mb-8">
+      <!-- ==================== 视图 4：成品作品库 ==================== -->
+      <section class="view view-scroll" id="view-library">
+        <div class="toolbar-bar">
           <div class="segmented" id="libraryTypeTabs">
-            <button class="active" data-lib="videos" onclick="setLibraryType('videos')">🎬 视频成品库</button>
-            <button data-lib="audios" onclick="setLibraryType('audios')">🎵 音频素材库</button>
+            <button class="active" data-lib="videos" onclick="setLibraryType('videos')">视频成品</button>
+            <button data-lib="audios" onclick="setLibraryType('audios')">音频素材</button>
           </div>
           <div class="flex-row">
-            <input class="input" id="libSearch" style="width:220px;" placeholder="搜索标题 / 文案..." oninput="renderLibraryView()" />
-            <button class="btn btn-sm" onclick="openDeliveryFolder()">📂 打开成片交付总目录</button>
+            <input class="input input-sm" id="libSearch" style="width:240px;" placeholder="搜索标题、人物或文案..." oninput="renderLibraryView()" />
+            <button class="btn btn-sm" id="btnOpenDeliveryFolder" onclick="openDeliveryFolder()">打开成片文件夹</button>
           </div>
         </div>
 
         <div class="library-layout">
-          <div class="card" style="padding:12px;">
-            <div class="flex-between mb-8">
+          <aside class="card category-sidebar">
+            <div class="flex-between mb-10">
               <strong style="font-size:13.5px;">作品分类</strong>
-              <button class="btn btn-sm btn-primary" onclick="promptNewCategory()">+ 新建</button>
+              <button class="btn btn-xs btn-primary" onclick="promptNewCategory()">+ 新建</button>
             </div>
             <div id="categoryList"></div>
-          </div>
-          <div>
-            <div class="media-grid" id="libraryGrid"></div>
-          </div>
+          </aside>
+          <div class="gallery-grid" id="libraryGrid"></div>
         </div>
       </section>
 
-      <!-- ==================== 视图 4：数字人模特与音色库 ==================== -->
-      <section class="view" id="view-models">
-        <div class="flex-between mb-8">
+      <!-- ==================== 视图 5：人物与声音资产中心 ==================== -->
+      <section class="view view-scroll" id="view-models">
+        <div class="toolbar-bar">
           <div class="segmented" id="modelSubTabs">
-            <button class="active" data-sub="models" onclick="setModelSubTab('models')">👤 数字人底模</button>
-            <button data-sub="voices" onclick="setModelSubTab('voices')">🎙 参考音色库</button>
+            <button class="active" data-sub="models" onclick="setModelSubTab('models')">人物底模视频</button>
+            <button data-sub="voices" onclick="setModelSubTab('voices')">参考声音库</button>
           </div>
           <div class="flex-row">
-            <button class="btn btn-sm" onclick="promptNewModelGroup()">+ 新建模特分组</button>
-            <button class="btn btn-sm btn-primary" onclick="openAddModelModal()">+ 导入新数字人模特</button>
-            <button class="btn btn-sm" onclick="openUploadVoiceModal()">+ 上传独立音色</button>
+            <button class="btn btn-sm btn-primary" id="btnModelsQuickPick" onclick="handleQuickAddModelClick()">+ 添加人物视频</button>
+            <button class="btn btn-sm" onclick="openAddModelModal()">上传 / 路径导入</button>
+            <button class="btn btn-sm" onclick="promptNewModelGroup()">+ 新建分组</button>
+            <button class="btn btn-sm" onclick="openUploadVoiceModal()">+ 上传声音</button>
           </div>
         </div>
 
         <div id="modelsSubPanel">
-          <div class="media-grid" id="modelsManageGrid"></div>
+          <div id="modelsDiscoverBar" class="mb-12"></div>
+          <div id="modelsManageMissingBar" class="hidden mb-12"></div>
+          <div class="gallery-grid" id="modelsManageGrid"></div>
         </div>
         <div id="voicesSubPanel" class="hidden">
-          <div class="media-grid" id="voicesManageGrid"></div>
+          <div class="gallery-grid" id="voicesManageGrid"></div>
         </div>
       </section>
 
-      <!-- ==================== 视图 5：自动化 AI 接口 ==================== -->
-      <section class="view" id="view-api">
-        <div class="two-col" style="align-items:start;">
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">🤖 标准化自动化 AI 接口说明</h3>
-              <a class="btn btn-sm btn-primary" href="/docs" target="_blank">打开交互式 Swagger 文档 ↗</a>
+      <!-- ==================== 视图 6：系统与服务（本机 / 服务器管理） ==================== -->
+      <section class="view view-scroll" id="view-system">
+        <!-- 本机与局域网/服务器访问地址卡片 -->
+        <div class="card mb-14">
+          <div class="card-header" style="margin-bottom:10px;">
+            <div>
+              <h2 class="card-title">访问方式（本机 & 局域网 / 服务器）</h2>
+              <div class="section-sub">本工作台同时支持在当前电脑本机访问，以及在同网络其他电脑/手机或服务器上通过浏览器访问。</div>
             </div>
-            <p class="section-sub">外部 AI Agent、Python 脚本、n8n、Coze 或定时任务可直接调用以下本机 REST API 实现全自动“文案/音频 → 数字人视频 → 成片下载”。</p>
-            <div class="path-box" style="line-height:1.8;">
-              <div><strong>GET</strong>  <code>/api/v1/health</code> — 全系统健康检查（Docker/TTS/队列/GPU/告警）</div>
-              <div><strong>GET</strong>  <code>/api/v1/models</code> — 获取可用数字人模特列表及底模健康状态</div>
-              <div><strong>POST</strong> <code>/api/v1/tts/synthesize</code> — 单独调用 IndexTTS2 合成音频（全参数）</div>
-              <div><strong>POST</strong> <code>/api/v1/jobs</code> — 单条创建数字人视频（支持文案+TTS参数 或 本地音频直驱）</div>
-              <div><strong>POST</strong> <code>/api/v1/jobs/batch</code> — 批量导入生成数字人视频</div>
-              <div><strong>GET</strong>  <code>/api/v1/jobs/{id}</code> — 查询实时阶段、帧进度%、ETA、报错与源文件路径</div>
-              <div><strong>POST</strong> <code>/api/v1/jobs/{id}/cancel</code> — 实时中断运行中/排队中任务</div>
-              <div><strong>POST</strong> <code>/api/v1/jobs/{id}/retry</code> — 失败/中断任务一键重试</div>
-              <div><strong>GET</strong>  <code>/api/v1/jobs/{id}/download</code> — 直接下载最终成片 MP4</div>
-              <div><strong>POST</strong> <code>/api/v1/system/recover</code> — 一键自愈拉起异常容器与守护服务</div>
-            </div>
-
-            <div class="mt-12">
-              <div class="flex-between mb-8">
-                <strong>Python 自动化调用示例（已自动填入你的真实模特 ID）</strong>
-                <button class="btn btn-sm" onclick="copyText(document.getElementById('apiPythonSnippet').textContent)">📋 复制代码</button>
+            <span class="badge badge-info" id="sysClientModeBadge">检测连接模式...</span>
+          </div>
+          <div class="access-grid" id="sysAccessGrid">
+            <div class="access-item">
+              <div class="access-label">本机访问地址</div>
+              <div class="access-value-row">
+                <code id="sysLocalUrl">http://127.0.0.1:8390</code>
+                <button class="btn btn-xs" onclick="copyText(document.getElementById('sysLocalUrl').textContent)">复制</button>
               </div>
-              <pre class="console-box" id="apiPythonSnippet" style="max-height:280px;"></pre>
+            </div>
+            <div class="access-item">
+              <div class="access-label">局域网 / 服务器访问地址</div>
+              <div id="sysLanUrlsWrap" class="access-lan-list">
+                <span class="section-sub">检测中...</span>
+              </div>
             </div>
           </div>
+        </div>
 
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title">🧪 在线接口联调测试台</h3>
+        <!-- 4 张核心引擎健康状态卡 -->
+        <div class="sys-grid mb-14">
+          <div class="sys-metric">
+            <div class="sys-metric-title">视频渲染引擎 (Duix.Avatar · 8383)</div>
+            <div class="sys-metric-val"><span class="dot" id="dotDocker"></span><span id="txtDocker">检测中...</span></div>
+            <div class="sys-metric-sub" id="subDocker">驱动数字人口型与画面渲染</div>
+          </div>
+          <div class="sys-metric">
+            <div class="sys-metric-title">语音合成引擎 (IndexTTS-2 · 18180)</div>
+            <div class="sys-metric-val"><span class="dot" id="dotTts"></span><span id="txtTts">检测中...</span></div>
+            <div class="sys-metric-sub" id="subTts">负责口播克隆配音与情绪控制</div>
+          </div>
+          <div class="sys-metric">
+            <div class="sys-metric-title">后台制作队列与守护进程</div>
+            <div class="sys-metric-val"><span class="dot" id="dotQueue"></span><span id="txtQueue">检测中...</span></div>
+            <div class="sys-metric-sub" id="subQueue">单任务串行排障、防显存溢出与自动恢复</div>
+          </div>
+          <div class="sys-metric">
+            <div class="sys-metric-title">显卡与存储空间</div>
+            <div class="sys-metric-val" id="pillGpu" style="font-size:13px;">检测显卡中...</div>
+            <div class="sys-metric-sub" id="pillDisk">检测磁盘中...</div>
+          </div>
+        </div>
+
+        <!-- 服务一键控制栏 & 告警 -->
+        <div class="card mb-14">
+          <div class="flex-between">
+            <div class="flex-row">
+              <button class="btn btn-primary" id="btnStartAll" onclick="handleStartAll()">一键启动全部服务</button>
+              <button class="btn btn-warning" id="btnRecover" onclick="handleRecover(false)">自愈修复（重拉异常服务与卡死任务）</button>
+              <button class="btn" id="btnPauseResume" onclick="handleTogglePause()">暂停队列</button>
+              <button class="btn" onclick="handleRecover(true)">强制重启渲染容器</button>
             </div>
-            <div class="two-col">
-              <div class="field">
-                <label>请求方法</label>
-                <select class="select" id="apiTestMethod">
-                  <option value="GET">GET</option>
-                  <option value="POST" selected>POST</option>
-                </select>
+            <button class="btn btn-danger" onclick="handleStopServices()">停止后台服务</button>
+          </div>
+          <div id="sysAlertsWrap" class="hidden mt-12"></div>
+        </div>
+
+        <!-- 实时运行日志面板 -->
+        <div class="card mb-14">
+          <div class="card-header" style="margin-bottom:10px;">
+            <h3 class="card-title">实时后台日志</h3>
+            <div class="flex-row">
+              <div class="segmented" id="logSourceTabs">
+                <button class="active" data-src="queue" onclick="loadLogSource('queue')">调度队列</button>
+                <button data-src="tts" onclick="loadLogSource('tts')">语音引擎</button>
+                <button data-src="docker" onclick="loadLogSource('docker')">视频渲染</button>
+                <button data-src="guard" onclick="loadLogSource('guard')">守护进程</button>
+              </div>
+              <button class="btn btn-sm" onclick="loadLogSource(state.logSource)">刷新日志</button>
+            </div>
+          </div>
+          <pre class="console-box" id="logsConsole" style="max-height:300px;">点击切换或刷新即可查看后台日志...</pre>
+        </div>
+
+        <!-- 折叠收纳：外部自动化接口（仅开发者/工作流对接时按需展开） -->
+        <details class="card dev-drawer" id="devApiDrawer" ontoggle="if(this.open) renderApiView()">
+          <summary class="dev-drawer-summary">
+            <div>
+              <strong>外部自动化接口（选配 · 供脚本 / n8n / Coze 批量调用）</strong>
+              <div class="section-sub">普通可视化做视频完全不需要点开这里；需要自动脚本对接时展开即可。</div>
+            </div>
+            <span class="badge badge-muted">点击展开 / 收起</span>
+          </summary>
+
+          <div class="two-col mt-14" style="align-items:start;">
+            <div>
+              <div class="flex-between mb-8">
+                <strong>常用接口速览</strong>
+                <a class="btn btn-xs btn-primary" href="/docs" target="_blank">打开交互文档 ↗</a>
+              </div>
+              <div class="path-box" style="line-height:1.85;">
+                <div><strong>服务地址：</strong><code id="studioEndpointHost">检测中...</code></div>
+                <div><strong>GET</strong>  <code>/api/v1/health</code> — 系统与引擎健康状态</div>
+                <div><strong>GET</strong>  <code>/api/v1/models</code> — 人物底模列表</div>
+                <div><strong>POST</strong> <code>/api/v1/tts/synthesize</code> — 单独合成配音</div>
+                <div><strong>POST</strong> <code>/api/v1/jobs</code> — 提交单条数字人制作</div>
+                <div><strong>POST</strong> <code>/api/v1/jobs/batch</code> — 批量提交制作</div>
+                <div><strong>GET</strong>  <code>/api/v1/jobs/{id}</code> — 查询阶段、帧进度与路径</div>
+                <div><strong>POST</strong> <code>/api/v1/jobs/{id}/cancel</code> — 实时中断任务</div>
+                <div><strong>GET</strong>  <code>/api/v1/jobs/{id}/download</code> — 下载成片 MP4</div>
+              </div>
+              <div class="mt-10">
+                <div class="flex-between mb-6">
+                  <strong style="font-size:13px;">Python 调用示例</strong>
+                  <button class="btn btn-xs" onclick="copyText(document.getElementById('apiPythonSnippet').textContent)">复制代码</button>
+                </div>
+                <pre class="console-box" id="apiPythonSnippet" style="max-height:220px;"></pre>
+              </div>
+            </div>
+
+            <div>
+              <strong style="display:block;margin-bottom:8px;">快速联调测试</strong>
+              <div class="two-col">
+                <div class="field">
+                  <label>请求方法</label>
+                  <select class="select" id="apiTestMethod">
+                    <option value="GET">GET</option>
+                    <option value="POST" selected>POST</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>接口路径</label>
+                  <input class="input" id="apiTestPath" value="/api/v1/jobs" />
+                </div>
+              </div>
+              <div class="flex-row mb-8">
+                <button class="btn btn-xs" onclick="fillApiDemo('health')">填充: 健康检查</button>
+                <button class="btn btn-xs" onclick="fillApiDemo('text_job')">填充: 文案制片</button>
+                <button class="btn btn-xs" onclick="fillApiDemo('audio_job')">填充: 音频制片</button>
               </div>
               <div class="field">
-                <label>接口路径</label>
-                <input class="input" id="apiTestPath" value="/api/v1/jobs" />
+                <label>请求内容 (JSON)</label>
+                <textarea class="textarea" id="apiTestBody" style="font-family:Consolas,monospace;min-height:140px;"></textarea>
               </div>
+              <button class="btn btn-sm btn-primary" onclick="runApiTest()">发送测试请求</button>
+              <pre class="console-box mt-8" id="apiTestResponse" style="max-height:190px;">等待测试...</pre>
             </div>
-            <div class="flex-row mb-8">
-              <button class="btn btn-sm" onclick="fillApiDemo('health')">填充: 健康检查</button>
-              <button class="btn btn-sm" onclick="fillApiDemo('text_job')">填充: 文案+IndexTTS2任务</button>
-              <button class="btn btn-sm" onclick="fillApiDemo('audio_job')">填充: 本地音频直驱任务</button>
+          </div>
+        </details>
+      </section>
+
+      <!-- ==================== 视图：云端自动同步 ==================== -->
+      <section class="view" id="view-cloudsync">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">云端成片自动拉回本地</h2>
+              <div class="section-sub">把今天 Colab 弹出的网页地址贴进来，以后云端每做好一条新视频，自动 8 线程高速保存到你本地文件夹，全程不用手动点下载</div>
+            </div>
+            <span class="status-chip" id="cloudSyncConnChip">
+              <span class="dot" id="cloudSyncConnDot"></span>
+              <span id="cloudSyncConnText">等待配置网址</span>
+            </span>
+          </div>
+
+          <div class="field">
+            <label for="cloudSyncUrlInput">Colab 云端创作台网址</label>
+            <input class="input" id="cloudSyncUrlInput" placeholder="例如：https://xxxx-xxxx.trycloudflare.com" />
+          </div>
+
+          <div class="grid-2">
+            <div class="field">
+              <label for="cloudSyncSaveDirInput">本地保存文件夹</label>
+              <input class="input" id="cloudSyncSaveDirInput" value="E:\数字人视频文件" />
             </div>
             <div class="field">
-              <label>请求 Body (JSON)</label>
-              <textarea class="textarea" id="apiTestBody" style="font-family:Consolas,monospace;min-height:180px;"></textarea>
-            </div>
-            <button class="btn btn-primary" onclick="runApiTest()">▶ 发送真实请求</button>
-            <div class="mt-12">
-              <label class="section-sub">响应结果：</label>
-              <pre class="console-box mt-8" id="apiTestResponse" style="max-height:260px;">等待测试...</pre>
+              <label for="cloudSyncQualitySelect">下载画质</label>
+              <select class="select" id="cloudSyncQualitySelect">
+                <option value="compact">原生 4K 视觉无损压小版（推荐，小约 5 倍、秒下）</option>
+                <option value="original">原始大片（不压缩，体积较大）</option>
+              </select>
             </div>
           </div>
+
+          <div class="flex-between mt-12" style="flex-wrap:wrap;gap:12px;">
+            <label class="flex-row" style="cursor:pointer;gap:8px;font-weight:500;">
+              <input type="checkbox" id="cloudSyncEnabledToggle" checked />
+              <span>开启后台自动拉回（每 15 秒静默检测新片，拉完弹出桌面提醒）</span>
+            </label>
+            <div class="flex-row" style="gap:8px;">
+              <button class="btn btn-primary" id="btnSaveCloudSync" onclick="saveCloudSyncConfig()">保存并开启同步</button>
+              <button class="btn" id="btnCloudSyncNow" onclick="triggerCloudSyncNow()">立即检测一次</button>
+              <button class="btn" onclick="openCloudSyncFolder()">打开本地文件夹</button>
+            </div>
+          </div>
+
+          <div id="cloudSyncActiveBox" class="path-box hidden mt-12">
+            <div class="flex-between">
+              <strong id="cloudSyncActiveTitle">正在拉回新成片...</strong>
+              <span id="cloudSyncActiveMeta">0%</span>
+            </div>
+            <div class="progress-track mt-8" style="height:8px;background:var(--border);border-radius:99px;overflow:hidden;">
+              <div id="cloudSyncActiveBar" style="height:100%;width:0%;background:var(--primary);transition:width 0.3s;"></div>
+            </div>
+          </div>
+
+          <div id="cloudSyncErrorBox" class="section-sub hidden mt-8" style="color:var(--danger);"></div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">已自动拉回本地的云端成片</h3>
+              <div class="section-sub" id="cloudSyncCountSub">共 0 条记录</div>
+            </div>
+            <button class="btn btn-sm" onclick="refreshCloudSyncStatus(true)">刷新列表</button>
+          </div>
+          <div id="cloudSyncList" class="empty-state">暂未拉回任何云端视频。贴入今天的 Colab 网址并点「保存并开启同步」即可自动开始。</div>
+          <details class="adv-box mt-12">
+            <summary>查看最近同步日志</summary>
+            <pre id="cloudSyncLogPre" class="path-box mt-8" style="max-height:180px;overflow:auto;white-space:pre-wrap;font-size:12px;">暂无日志</pre>
+          </details>
         </div>
       </section>
     </main>
@@ -458,82 +865,88 @@
 </div>
 
 <!-- ==================== 通用弹窗 ==================== -->
+
 <!-- 视频预览弹窗 -->
 <div class="modal-backdrop hidden" id="previewModal" onclick="if(event.target===this) closeModal('previewModal')">
   <div class="modal">
     <div class="card-header">
       <h3 class="card-title" id="previewModalTitle">视频预览</h3>
-      <button class="btn btn-sm" onclick="closeModal('previewModal')">✕ 关闭</button>
+      <button class="btn btn-sm" onclick="closeModal('previewModal')">关闭</button>
+    </div>
+    <div id="previewModalFallback" class="preview-fallback hidden">
+      <img id="previewModalPosterImg" class="preview-poster-img" alt="视频封面" />
+      <div class="preview-fallback-bar">
+        <span id="previewFallbackText">当前视频为高清 HEVC / MOV 编码，浏览器仅解码音轨（不影响数字人制作），可直接用电脑播放器观看高清画面：</span>
+        <div class="flex-row" style="flex-shrink:0;">
+          <button class="btn btn-sm btn-primary" id="btnPreviewOpenPlayer" onclick="openPreviewInLocalPlayer()">用电脑播放器观看</button>
+          <button class="btn btn-sm" id="btnPreviewOpenFolder" onclick="openPreviewFolder()">打开文件位置</button>
+          <a class="btn btn-sm btn-primary hidden" id="btnPreviewDownload" download>下载视频查看</a>
+        </div>
+      </div>
     </div>
     <video id="previewModalVideo" class="preview-player" controls autoplay></video>
-    <div id="previewModalMeta" class="path-box mt-12"></div>
+    <div class="flex-between mt-12" style="gap:10px;">
+      <div id="previewModalMeta" class="path-box" style="margin-top:0;flex:1;"></div>
+      <button class="btn btn-sm hidden" id="btnPreviewExternal" onclick="openPreviewInLocalPlayer()">本机播放器打开</button>
+    </div>
   </div>
 </div>
 
-<!-- 实时日志弹窗 -->
-<div class="modal-backdrop hidden" id="logsModal" onclick="if(event.target===this) closeModal('logsModal')">
-  <div class="modal" style="width:min(920px,96vw);">
-    <div class="card-header">
-      <h3 class="card-title">📜 后台实时运行日志（告别黑框命令行）</h3>
-      <button class="btn btn-sm" onclick="closeModal('logsModal')">✕ 关闭</button>
-    </div>
-    <div class="flex-between mb-8">
-      <div class="segmented" id="logSourceTabs">
-        <button class="active" data-src="queue" onclick="loadLogSource('queue')">调度队列日志</button>
-        <button data-src="tts" onclick="loadLogSource('tts')">IndexTTS2 语音日志</button>
-        <button data-src="docker" onclick="loadLogSource('docker')">Docker 视频渲染日志</button>
-        <button data-src="guard" onclick="loadLogSource('guard')">守护自愈日志</button>
-      </div>
-      <button class="btn btn-sm" onclick="loadLogSource(state.logSource)">🔄 刷新日志</button>
-    </div>
-    <pre class="console-box" id="logsConsole" style="max-height:60vh;">加载中...</pre>
-  </div>
-</div>
-
-<!-- 导入/重新关联模特弹窗 -->
+<!-- 添加 / 补回人物视频弹窗 -->
 <div class="modal-backdrop hidden" id="modelModal" onclick="if(event.target===this) closeModal('modelModal')">
   <div class="modal" style="width:min(540px,95vw);">
     <div class="card-header">
-      <h3 class="card-title" id="modelModalTitle">导入新数字人模特</h3>
-      <button class="btn btn-sm" onclick="closeModal('modelModal')">✕ 关闭</button>
+      <h3 class="card-title" id="modelModalTitle">添加人物视频</h3>
+      <button class="btn btn-sm" onclick="closeModal('modelModal')">关闭</button>
     </div>
     <input type="hidden" id="modelModalRelinkId" value="" />
+
+    <div class="field">
+      <label style="font-weight:600;color:var(--text);">选择视频文件（MP4 / MOV）</label>
+      <div class="flex-row">
+        <button class="btn btn-primary" id="btnModalPickVideo" onclick="pickVideoIntoModal()">从电脑选择视频（秒导入）</button>
+        <label class="btn" style="cursor:pointer;">
+          网页上传视频
+          <input type="file" id="modelModalFile" accept="video/*" style="display:none;" onchange="onModalVideoFilePicked(this)" />
+        </label>
+      </div>
+      <div id="modelModalPickedHint" class="section-sub mt-8">还未选择视频文件</div>
+    </div>
+
     <div class="field" id="modelModalNameField">
-      <label>模特名称</label>
-      <input class="input" id="modelModalName" placeholder="例如：室内主讲人A" />
+      <label>人物名称（留空自动使用视频文件名）</label>
+      <input class="input" id="modelModalName" placeholder="例如：小张室内出镜" />
     </div>
     <div class="field" id="modelModalGroupField">
-      <label>所属分组（可选）</label>
+      <label>分组（可选）</label>
       <select class="select" id="modelModalGroup"></select>
     </div>
-    <div class="field">
-      <label>方式一：直接上传视频文件（MP4 / MOV）</label>
-      <input type="file" class="input" id="modelModalFile" accept="video/*" />
-    </div>
-    <div class="field">
-      <label>方式二：填写本机视频绝对路径（大文件秒复制，无需浏览器上传等待）</label>
-      <input class="input" id="modelModalLocalPath" placeholder="例如：E:\数字人视频文件\拍摄的视频\福联.mov" />
-    </div>
+
+    <details class="adv-box">
+      <summary id="summaryModalLocalVideoPath">手动粘贴本机视频路径（可选）</summary>
+      <input class="input mt-8" id="modelModalLocalPath" placeholder="例如：E:\数字人视频文件\拍摄的视频\福联.mov" oninput="onModalLocalPathTyped()" />
+    </details>
+
     <div class="flex-row mt-12" style="justify-content:flex-end;">
       <button class="btn" onclick="closeModal('modelModal')">取消</button>
-      <button class="btn btn-primary" id="btnSubmitModelModal" onclick="submitModelModal()">确认导入</button>
+      <button class="btn btn-primary" id="btnSubmitModelModal" onclick="submitModelModal()">确认添加</button>
     </div>
   </div>
 </div>
 
-<!-- 上传独立音色弹窗 -->
+<!-- 上传新声音弹窗 -->
 <div class="modal-backdrop hidden" id="voiceModal" onclick="if(event.target===this) closeModal('voiceModal')">
   <div class="modal" style="width:min(460px,95vw);">
     <div class="card-header">
-      <h3 class="card-title">上传自定义参考音色</h3>
-      <button class="btn btn-sm" onclick="closeModal('voiceModal')">✕ 关闭</button>
+      <h3 class="card-title">上传参考声音</h3>
+      <button class="btn btn-sm" onclick="closeModal('voiceModal')">关闭</button>
     </div>
     <div class="field">
-      <label>音色名称</label>
-      <input class="input" id="voiceModalName" placeholder="例如：我的清晰男声样本" />
+      <label>声音名称</label>
+      <input class="input" id="voiceModalName" placeholder="例如：清晰男声样本" />
     </div>
     <div class="field">
-      <label>选择参考音频（建议 5~20 秒清晰无背景音乐人声）</label>
+      <label>选择音频（建议 5~20 秒清晰无背景音乐的人声）</label>
       <input type="file" class="input" id="voiceModalFile" accept="audio/*" />
     </div>
     <div class="flex-row mt-12" style="justify-content:flex-end;">
@@ -547,18 +960,18 @@
 <div class="modal-backdrop hidden" id="recoverModal" onclick="if(event.target===this) closeModal('recoverModal')">
   <div class="modal" style="width:min(560px,95vw);">
     <div class="card-header">
-      <h3 class="card-title">🩺 系统自愈诊断报告</h3>
-      <button class="btn btn-sm" onclick="closeModal('recoverModal')">✕ 关闭</button>
+      <h3 class="card-title">系统启动与诊断报告</h3>
+      <button class="btn btn-sm" onclick="closeModal('recoverModal')">关闭</button>
     </div>
     <div id="recoverReportBody"></div>
     <div class="flex-row mt-12" style="justify-content:space-between;">
-      <button class="btn btn-danger btn-sm" onclick="handleRecover(true)">强制重启视频渲染容器</button>
+      <button class="btn btn-danger btn-sm" onclick="handleRecover(true)">强制重启渲染容器</button>
       <button class="btn btn-primary" onclick="closeModal('recoverModal')">完成</button>
     </div>
   </div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=2.5"></script>
 </body>
 </html>

@@ -1,0 +1,597 @@
+# -*- coding: utf-8 -*-
+"""
+云端数字人成片自动拉回本地守护引擎（零黑窗、8 线程断点高速拉取、自动去重与验片）。
+运行在本机 HeyGem Studio (8390) 后台线程中，每隔设定秒数轮询 Colab 云端创作台：
+1. 自动发现新完成（status=success）的成品视频；
+2. 自动触发/复用云端原生 4K 60帧视觉无损压小版（~5 倍瘦身）；
+3. 优先直连 HTTP/2 8 线程并发拉取到本机指定目录（默认 E:\数字人视频文件）；
+4. 完整校验字节数与 ffprobe 音视频流后原子落盘，并弹出 Windows 桌面完成提醒。
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "logs" / "cloud_sync_state.json"
+DEFAULT_SAVE_DIR = Path(r"E:\数字人视频文件")
+
+
+def _safe_filename(name: str, fallback: str = "video") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+    return (cleaned[:60] or fallback)
+
+
+def _resolve_ffprobe() -> str | None:
+    for cand in (
+        PROJECT_ROOT / "bin" / "ffprobe.exe",
+        Path(r"E:\app\Miniconda\Library\bin\ffprobe.exe"),
+    ):
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("ffprobe")
+
+
+def _verify_mp4_basic(path: Path) -> tuple[bool, str]:
+    """基础完整性验证：检查文件大小及（若存在 ffprobe）解析音视频流。"""
+    if not path.is_file() or path.stat().st_size < 1024:
+        return False, "文件体积异常过小"
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe:
+        return True, "size_ok"
+    try:
+        res = subprocess.run(
+            [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if res.returncode != 0:
+            return False, (res.stderr or "ffprobe 校验失败")[:160]
+        info = json.loads(res.stdout or "{}")
+        streams = info.get("streams") or []
+        has_v = any(s.get("codec_type") == "video" for s in streams)
+        dur = float((info.get("format") or {}).get("duration") or 0)
+        if not has_v or dur <= 0.05:
+            return False, "未检测到有效视频轨或时长异常"
+        v = next(s for s in streams if s.get("codec_type") == "video")
+        return True, f"{v.get('width')}x{v.get('height')} · {dur:.1f}s"
+    except Exception as exc:
+        return True, f"ffprobe跳过({exc})"
+
+
+def _send_windows_toast(title: str, body: str) -> None:
+    """无黑窗弹出 Windows 右下角静默提示气泡（失败自动忽略，绝不影响同步主流程）。"""
+    if os.name != "nt":
+        return
+    try:
+        safe_title = title.replace("'", " ").replace("\n", " ")[:80]
+        safe_body = body.replace("'", " ").replace("\n", " ")[:180]
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$n = New-Object System.Windows.Forms.NotifyIcon; "
+            "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+            "$n.Visible = $true; "
+            f"$n.ShowBalloonTip(5000, '{safe_title}', '{safe_body}', [System.Windows.Forms.ToolTipIcon]::Info); "
+            "Start-Sleep -Milliseconds 5500; $n.Dispose()"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
+class CloudAutoSyncManager:
+    """云端数字人成片后台自动同步管理器。"""
+
+    def __init__(self, config_path: Path | None = None) -> None:
+        self.config_path = config_path or DEFAULT_CONFIG_PATH
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        self._config: dict[str, Any] = {
+            "enabled": False,
+            "cloud_url": "",
+            "cloud_token": "",
+            "save_dir": str(DEFAULT_SAVE_DIR),
+            "quality": "compact",  # compact=原生4K压小版 / original=原片
+            "poll_interval": 15,
+            "threads": 8,
+            "notify_desktop": True,
+            "synced": {},  # key -> {video_id, name, local_path, size_mb, saved_at, meta}
+        }
+        self._runtime: dict[str, Any] = {
+            "connected": False,
+            "cloud_video_count": 0,
+            "last_check_at": 0.0,
+            "last_error": "",
+            "active_download": None,
+            "recent_events": [],
+        }
+        self._load_config()
+
+    def _log_event(self, msg: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        line = f"[{stamp}] {msg}"
+        with self._lock:
+            ev = self._runtime["recent_events"]
+            ev.append(line)
+            if len(ev) > 40:
+                del ev[:-40]
+
+    def _load_config(self) -> None:
+        if not self.config_path.is_file():
+            return
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                with self._lock:
+                    for k in ("enabled", "cloud_url", "cloud_token", "save_dir", "quality", "poll_interval", "threads", "notify_desktop"):
+                        if k in raw:
+                            self._config[k] = raw[k]
+                    if isinstance(raw.get("synced"), dict):
+                        self._config["synced"] = raw["synced"]
+        except Exception:
+            pass
+
+    def _save_config(self) -> None:
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                payload = json.dumps(self._config, ensure_ascii=False, indent=2)
+            tmp = self.config_path.with_suffix(".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, self.config_path)
+        except Exception:
+            pass
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._loop, name="CloudAutoSync", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+    def wake(self) -> None:
+        self._wake_event.set()
+
+    def update_config(
+        self,
+        *,
+        enabled: bool | None = None,
+        cloud_url: str | None = None,
+        cloud_token: str | None = None,
+        save_dir: str | None = None,
+        quality: str | None = None,
+        poll_interval: int | None = None,
+        notify_desktop: bool | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if enabled is not None:
+                self._config["enabled"] = bool(enabled)
+            if cloud_url is not None:
+                u = cloud_url.strip().rstrip("/")
+                if u and not u.startswith(("http://", "https://")):
+                    u = "https://" + u
+                self._config["cloud_url"] = u
+                self._runtime["last_error"] = ""
+            if cloud_token is not None:
+                self._config["cloud_token"] = cloud_token.strip()
+            if save_dir is not None and save_dir.strip():
+                p = Path(save_dir.strip())
+                p.mkdir(parents=True, exist_ok=True)
+                self._config["save_dir"] = str(p)
+            if quality in ("compact", "original", "hevc"):
+                self._config["quality"] = quality
+            if poll_interval is not None:
+                self._config["poll_interval"] = max(5, min(300, int(poll_interval)))
+            if notify_desktop is not None:
+                self._config["notify_desktop"] = bool(notify_desktop)
+        self._save_config()
+        self._log_event(
+            f"配置已更新：{'已开启自动拉回' if self._config['enabled'] else '已暂停'} · "
+            f"保存目录 {self._config['save_dir']}"
+        )
+        self.wake()
+        return self.get_status()
+
+    def mark_already_synced(self, key: str, info: dict[str, Any]) -> None:
+        with self._lock:
+            self._config["synced"][key] = info
+        self._save_config()
+
+    def get_status(self) -> dict[str, Any]:
+        with self._lock:
+            synced_map = dict(self._config.get("synced") or {})
+            items = []
+            for key, item in synced_map.items():
+                if not isinstance(item, dict):
+                    continue
+                lp = Path(str(item.get("local_path") or ""))
+                items.append({
+                    **item,
+                    "sync_key": key,
+                    "exists": lp.is_file() if str(lp) else False,
+                })
+            items.sort(key=lambda x: float(x.get("saved_at") or 0), reverse=True)
+            return {
+                "enabled": bool(self._config.get("enabled")),
+                "cloud_url": self._config.get("cloud_url") or "",
+                "has_token": bool(self._config.get("cloud_token")),
+                "save_dir": self._config.get("save_dir") or str(DEFAULT_SAVE_DIR),
+                "quality": self._config.get("quality") or "compact",
+                "poll_interval": int(self._config.get("poll_interval") or 15),
+                "notify_desktop": bool(self._config.get("notify_desktop", True)),
+                "connected": bool(self._runtime.get("connected")),
+                "cloud_video_count": int(self._runtime.get("cloud_video_count") or 0),
+                "last_check_at": float(self._runtime.get("last_check_at") or 0.0),
+                "last_error": self._runtime.get("last_error") or "",
+                "active_download": self._runtime.get("active_download"),
+                "synced_count": len(items),
+                "synced_items": items[:30],
+                "recent_events": list(self._runtime.get("recent_events") or [])[-20:],
+            }
+
+    def _build_openers(self) -> list[urllib.request.OpenerDirector]:
+        """优先直连（走 HTTP/2 速度最快），失败自动回退系统代理。"""
+        return [
+            urllib.request.build_opener(urllib.request.ProxyHandler({})),
+            urllib.request.build_opener(),
+        ]
+
+    def _http_request(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 20,
+    ) -> tuple[int, dict[str, str], bytes, urllib.request.OpenerDirector]:
+        req_headers = dict(headers or {})
+        tok = (self._config.get("cloud_token") or "").strip()
+        if tok:
+            req_headers["Authorization"] = f"Bearer {tok}"
+        last_exc: Exception | None = None
+        for opener in self._build_openers():
+            try:
+                req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+                with opener.open(req, timeout=timeout) as resp:
+                    body = resp.read() if method != "HEAD" else b""
+                    hdrs = {k.lower(): v for k, v in resp.headers.items()}
+                    return resp.status, hdrs, body, opener
+            except urllib.error.HTTPError as he:
+                # HTTP 层返回（如 404/500/524）说明网络已连通，直接抛出
+                raise he
+            except Exception as exc:
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    def _video_sync_key(self, video: dict[str, Any]) -> str:
+        vid = int(video.get("id") or 0)
+        code = str(video.get("code") or "").strip()
+        created = str(video.get("created_at") or "").strip()
+        if code:
+            return f"{vid}:{code}"
+        return f"{vid}:{created}"
+
+    def _build_local_filename(self, video: dict[str, Any], quality: str) -> str:
+        vid = int(video.get("id") or 0)
+        name = _safe_filename(str(video.get("name") or f"视频{vid}"), fallback=f"视频{vid}")
+        model = _safe_filename(str(video.get("model_name") or ""), fallback="")
+        day = time.strftime("%Y%m%d")
+        tag = "4K原画压小" if quality != "original" else "原片"
+        parts = [f"云端成品_{vid}"]
+        if name and name not in ("1", "2", "3", str(vid)):
+            parts.append(name)
+        elif model:
+            parts.append(model)
+        parts.append(day)
+        parts.append(tag)
+        return "_".join(parts) + ".mp4"
+
+    def _existing_local_match(self, save_dir: Path, video: dict[str, Any], quality: str) -> Path | None:
+        """兼容检查：如果该视频之前已按标准命名拉回本地（例如昨天已拉回的 1/2/3），避免重复下载。"""
+        vid = int(video.get("id") or 0)
+        if not save_dir.is_dir():
+            return None
+        tag = "4K原画压小" if quality != "original" else "原片"
+        for p in save_dir.glob(f"云端成品_{vid}_*{tag}.mp4"):
+            if p.is_file() and p.stat().st_size > 1024 * 1024:
+                return p
+        return None
+
+    def sync_once(self) -> dict[str, Any]:
+        with self._lock:
+            cloud_url = (self._config.get("cloud_url") or "").strip().rstrip("/")
+            save_dir = Path(self._config.get("save_dir") or str(DEFAULT_SAVE_DIR))
+            quality = str(self._config.get("quality") or "compact")
+            threads = max(1, min(12, int(self._config.get("threads") or 8)))
+            notify = bool(self._config.get("notify_desktop", True))
+
+        if not cloud_url:
+            with self._lock:
+                self._runtime["connected"] = False
+                self._runtime["last_check_at"] = time.time()
+            return {"ok": False, "reason": "未配置云端网址"}
+
+        try:
+            status, _, body, _ = self._http_request(f"{cloud_url}/api/videos", timeout=15)
+            if status != 200:
+                raise RuntimeError(f"云端返回 HTTP {status}")
+            payload = json.loads(body.decode("utf-8"))
+            videos = payload.get("videos", []) if isinstance(payload, dict) else payload
+        except Exception as exc:
+            with self._lock:
+                self._runtime["connected"] = False
+                self._runtime["last_check_at"] = time.time()
+                self._runtime["last_error"] = f"暂时连不上云端：{exc}"
+            return {"ok": False, "reason": str(exc)}
+
+        done_videos = [
+            v for v in videos
+            if isinstance(v, dict) and v.get("status") == "success" and v.get("file_ready")
+        ]
+        # 按 id 升序同步，确保先做完的先落盘
+        done_videos.sort(key=lambda x: int(x.get("id") or 0))
+
+        with self._lock:
+            self._runtime["connected"] = True
+            self._runtime["cloud_video_count"] = len(done_videos)
+            self._runtime["last_check_at"] = time.time()
+            self._runtime["last_error"] = ""
+
+        pulled = 0
+        for v in done_videos:
+            if self._stop_event.is_set():
+                break
+            key = self._video_sync_key(v)
+            with self._lock:
+                already = self._config["synced"].get(key)
+            if already:
+                continue
+
+            # 若本地目录已存在同名成片（例如此前手动或脚本已拉回），直接登记免重复拉取
+            existing = self._existing_local_match(save_dir, v, quality)
+            if existing is not None:
+                self.mark_already_synced(key, {
+                    "video_id": int(v.get("id") or 0),
+                    "name": str(v.get("name") or ""),
+                    "local_path": str(existing),
+                    "size_mb": round(existing.stat().st_size / 1048576.0, 2),
+                    "saved_at": existing.stat().st_mtime,
+                    "meta": "检测到本地已有成片，自动登记去重",
+                })
+                continue
+
+            try:
+                self._download_one_video(cloud_url, v, save_dir, quality, threads, notify, key)
+                pulled += 1
+            except Exception as exc:
+                self._log_event(f"拉取 #{v.get('id')} 暂遇波动（下轮自动续传）：{exc}")
+                with self._lock:
+                    self._runtime["last_error"] = f"视频 #{v.get('id')} 同步出错：{exc}"
+                    self._runtime["active_download"] = None
+
+        return {"ok": True, "cloud_done": len(done_videos), "pulled": pulled}
+
+    def _download_one_video(
+        self,
+        cloud_url: str,
+        video: dict[str, Any],
+        save_dir: Path,
+        quality: str,
+        threads: int,
+        notify: bool,
+        sync_key: str,
+    ) -> None:
+        vid = int(video.get("id") or 0)
+        vname = str(video.get("name") or f"视频#{vid}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            self._runtime["active_download"] = {
+                "video_id": vid,
+                "name": vname,
+                "stage": "云端原画压小准备中..." if quality != "original" else "准备拉取原片...",
+                "percent": 0.0,
+                "downloaded_mb": 0.0,
+                "total_mb": 0.0,
+                "speed_mbs": 0.0,
+            }
+
+        # 1. 若选择压小版，先触发云端 GPU 压小（若后台已自动压好则 0 秒秒回）
+        if quality != "original":
+            self._log_event(f"发现新成片 #{vid}（{vname}），正在获取云端 4K 原画压小版...")
+            dl_rel = f"/api/media/video/{vid}?download=1&quality={quality}"
+            for attempt in range(1, 5):
+                if self._stop_event.is_set():
+                    return
+                try:
+                    st, _, body, _ = self._http_request(
+                        f"{cloud_url}/api/videos/{vid}/compact?quality={quality}",
+                        method="POST",
+                        data=b"",
+                        timeout=180,
+                    )
+                    if st == 200:
+                        cres = json.loads(body.decode("utf-8"))
+                        dl_rel = cres.get("download_url") or dl_rel
+                        break
+                except urllib.error.HTTPError as he:
+                    if he.code in (502, 504, 520, 524) and attempt < 4:
+                        time.sleep(8)
+                        continue
+                    raise
+                except Exception:
+                    if attempt < 4:
+                        time.sleep(6)
+                        continue
+                    raise
+        else:
+            dl_rel = f"/api/media/video/{vid}?download=1&quality=original"
+
+        dl_url = f"{cloud_url}{dl_rel}"
+        st_head, hdrs, _, fast_opener = self._http_request(dl_url, method="HEAD", timeout=30)
+        if st_head != 200:
+            raise RuntimeError(f"HEAD 探测返回 {st_head}")
+        total = int(hdrs.get("content-length") or "0")
+        if total <= 0:
+            raise RuntimeError("云端未返回有效文件长度")
+        accept_ranges = "bytes" in (hdrs.get("accept-ranges") or "").lower()
+
+        dst_name = self._build_local_filename(video, quality)
+        dst = save_dir / dst_name
+        part = dst.with_name(dst.name + ".part")
+
+        self._log_event(f"开始 8 线程高速拉回 #{vid} -> {dst_name} ({total / 1048576:.1f} MB)")
+        t0 = time.time()
+        done_bytes = [0]
+        write_lock = threading.Lock()
+        tok = (self._config.get("cloud_token") or "").strip()
+
+        with open(part, "wb") as f:
+            f.truncate(total)
+
+        def _update_prog(added: int) -> None:
+            done_bytes[0] += added
+            dt = max(0.05, time.time() - t0)
+            mb_done = done_bytes[0] / 1048576.0
+            mb_tot = total / 1048576.0
+            with self._lock:
+                self._runtime["active_download"] = {
+                    "video_id": vid,
+                    "name": vname,
+                    "stage": "高速拉回本地中...",
+                    "percent": round(min(100.0, done_bytes[0] * 100.0 / total), 1),
+                    "downloaded_mb": round(mb_done, 1),
+                    "total_mb": round(mb_tot, 1),
+                    "speed_mbs": round(mb_done / dt, 2),
+                }
+
+        if accept_ranges and total > 4 * 1024 * 1024:
+            chunk_size = 4 * 1024 * 1024
+            ranges = [(pos, min(total - 1, pos + chunk_size - 1)) for pos in range(0, total, chunk_size)]
+
+            def _fetch_chunk(se: tuple[int, int]) -> int:
+                s, e = se
+                expect = e - s + 1
+                for retry in range(1, 7):
+                    if self._stop_event.is_set():
+                        raise RuntimeError("同步服务停止")
+                    try:
+                        hdr = {"Range": f"bytes={s}-{e}"}
+                        if tok:
+                            hdr["Authorization"] = f"Bearer {tok}"
+                        req = urllib.request.Request(dl_url, headers=hdr)
+                        with fast_opener.open(req, timeout=45) as resp:
+                            buf = resp.read()
+                            if len(buf) != expect:
+                                raise RuntimeError(f"分块长度不足 {len(buf)}/{expect}")
+                        with write_lock:
+                            with open(part, "r+b") as wf:
+                                wf.seek(s)
+                                wf.write(buf)
+                        _update_prog(expect)
+                        return expect
+                    except Exception:
+                        if retry == 6:
+                            raise
+                        time.sleep(1.2 * retry)
+                return 0
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+                futs = [ex.submit(_fetch_chunk, se) for se in ranges]
+                for fut in concurrent.futures.as_completed(futs):
+                    fut.result()
+        else:
+            hdr = {"Authorization": f"Bearer {tok}"} if tok else {}
+            req = urllib.request.Request(dl_url, headers=hdr)
+            with fast_opener.open(req, timeout=300) as resp, open(part, "wb") as wf:
+                while True:
+                    block = resp.read(1024 * 1024)
+                    if not block:
+                        break
+                    wf.write(block)
+                    _update_prog(len(block))
+
+        if part.stat().st_size != total:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"下载体积不匹配 ({part.stat().st_size} != {total})")
+
+        ok_v, meta_desc = _verify_mp4_basic(part)
+        if not ok_v:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"视频完整性校验未通过：{meta_desc}")
+
+        os.replace(part, dst)
+        dt = max(0.05, time.time() - t0)
+        spd = (total / 1048576.0) / dt
+        size_mb = round(total / 1048576.0, 2)
+
+        self.mark_already_synced(sync_key, {
+            "video_id": vid,
+            "name": vname,
+            "local_path": str(dst),
+            "size_mb": size_mb,
+            "saved_at": time.time(),
+            "meta": f"{meta_desc} · 均速 {spd:.2f} MB/s",
+        })
+        with self._lock:
+            self._runtime["active_download"] = None
+        self._log_event(f"✅ #{vid} 已自动保存到 {dst.name}（{size_mb} MB，均速 {spd:.2f} MB/s）")
+        if notify:
+            _send_windows_toast(
+                "云端数字人新视频已自动下载完成",
+                f"{dst.name}（{size_mb} MB）已保存到 {save_dir}",
+            )
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                enabled = bool(self._config.get("enabled"))
+                cloud_url = (self._config.get("cloud_url") or "").strip()
+                interval = int(self._config.get("poll_interval") or 15)
+            if enabled and cloud_url:
+                try:
+                    self.sync_once()
+                except Exception as exc:
+                    with self._lock:
+                        self._runtime["last_error"] = str(exc)
+            self._wake_event.clear()
+            self._wake_event.wait(timeout=interval)
+
+
+# 单例实例，供 studio.server 挂载
+cloud_sync_manager = CloudAutoSyncManager()

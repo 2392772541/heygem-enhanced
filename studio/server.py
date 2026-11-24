@@ -5,6 +5,7 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from core.cloud_auto_sync import cloud_sync_manager
 from . import system_ctrl
 from .db import (
     CREATE_NO_WINDOW,
@@ -58,16 +60,20 @@ def _verify_api_key(
 async def lifespan(_app: FastAPI):
     init_studio_schema()
     resolve_studio_assets_root()
-    yield
+    cloud_sync_manager.start()
+    try:
+        yield
+    finally:
+        cloud_sync_manager.stop()
 
 
 app = FastAPI(
-    title="HeyGem Studio · 数字人 & IndexTTS2 统一中枢 API",
-    version="2.0.0",
+    title="HeyGem Studio · 数字人一体化工作台",
+    version="2.1.0",
     description=(
-        "本地数字人（Duix.Avatar）与 IndexTTS2 深度融合控制中心及自动化 AI 接口。\n\n"
-        "支持单条/批量提交口播文案或本地音频生成数字人视频、全参数 IndexTTS2 试听与调参、"
-        "实时帧级进度追踪、随时中断恢复、作品分类与成片下载。"
+        "本地与服务器通用的可视化数字人创作工作台（融合 Duix.Avatar 渲染引擎与 IndexTTS-2 语音合成），"
+        "同时提供可选的自动化接口。\n\n"
+        "支持单条/批量口播制作、独立 IndexTTS-2 调音试听、实时帧级进度追踪、随时中断自愈、成品分类管理与下载。"
     ),
     lifespan=lifespan,
 )
@@ -78,6 +84,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _friendly_tts_conn_error(exc: Exception) -> str:
+    """将底层 socket/urlopen 连接异常转换为清晰易懂的中文提示，避免裸露 WinError 堆栈。"""
+    msg = str(exc or "")
+    low = msg.lower()
+    if any(k in low for k in ("10061", "refused", "积极拒绝", "cannot connect", "connection reset", "timed out", "timeout", "urlopen error")):
+        return "IndexTTS-2 语音引擎 (18180) 当前未启动或无响应，请先点击页面顶部「一键启动服务」后再试"
+    return f"IndexTTS-2 语音引擎 (18180) 暂不可用：{msg}"
 
 
 def _proxy_tts_json(method: str, path: str, payload: dict[str, Any] | None = None, timeout: float = 15.0) -> dict[str, Any]:
@@ -97,7 +112,7 @@ def _proxy_tts_json(method: str, path: str, payload: dict[str, Any] | None = Non
             msg = body or str(exc)
         raise HTTPException(status_code=exc.code if 400 <= exc.code < 600 else 502, detail=msg)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"IndexTTS2 语音服务 (18180) 暂不可用：{exc}")
+        raise HTTPException(status_code=503, detail=_friendly_tts_conn_error(exc))
 
 
 def _convert_to_wav(src: Path, dst: Path, sample_rate: int = 22050) -> Path:
@@ -130,6 +145,158 @@ def _convert_to_wav(src: Path, dst: Path, sample_rate: int = 22050) -> Path:
     return dst
 
 
+_IMAGE_ONLY_FORMATS = {"image2", "jpeg_pipe", "png_pipe", "bmp_pipe", "webp_pipe", "tiff_pipe", "ppm_pipe", "svg_pipe"}
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _is_local_client(request: Request) -> bool:
+    """判断请求是否来自本机回环地址（远程局域网或经反向代理访问时禁止在宿主机桌面弹窗）。"""
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        first_ip = xff.split(",")[0].strip().lower()
+        if first_ip and first_ip not in _LOCAL_HOSTS:
+            return False
+    x_real = (request.headers.get("x-real-ip") or "").strip().lower()
+    if x_real and x_real not in _LOCAL_HOSTS:
+        return False
+    host = ((request.client.host if request.client else "") or "").strip().lower()
+    return host in _LOCAL_HOSTS
+
+
+def _require_local_client(request: Request, action_hint: str) -> None:
+    if not _is_local_client(request):
+        raise HTTPException(status_code=403, detail=f"当前为远程浏览器访问，暂不支持在宿主机{action_hint}，请改用网页上传或下载")
+
+
+def _probe_media_streams(path: Path) -> tuple[bool, bool]:
+    """用 ffprobe 检测媒体文件是否包含真实视频流（排除静态图/MP3 封面图）与音频流。"""
+    from .db import resolve_ffprobe_exe
+
+    try:
+        res = subprocess.run(
+            [
+                resolve_ffprobe_exe(),
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_entries",
+                "format=format_name:stream=codec_type,codec_name:stream_disposition=attached_pic",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return False, False
+        payload = json.loads(res.stdout)
+        fmt_names = {x.strip().lower() for x in str((payload.get("format") or {}).get("format_name") or "").split(",") if x.strip()}
+        if fmt_names and fmt_names.issubset(_IMAGE_ONLY_FORMATS):
+            return False, False
+        streams = payload.get("streams") or []
+        has_video = any(
+            s.get("codec_type") == "video" and int((s.get("disposition") or {}).get("attached_pic") or 0) == 0
+            for s in streams
+        )
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        return has_video, has_audio
+    except Exception:
+        # ffprobe 不可用时放行交由后续 ffmpeg 判定
+        return True, True
+
+
+def _model_thumb_path(model_id: int) -> Path:
+    thumbs_dir = resolve_studio_assets_root() / "thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    return thumbs_dir / f"model_{model_id}.jpg"
+
+
+def _video_thumb_path(job_id: int) -> Path:
+    thumbs_dir = resolve_studio_assets_root() / "thumbs"
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    return thumbs_dir / f"video_{job_id}.jpg"
+
+
+def _remove_model_thumbnail(model_id: int) -> None:
+    try:
+        _model_thumb_path(model_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _remove_video_thumbnail(job_id: int) -> None:
+    try:
+        _video_thumb_path(job_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _extract_video_thumbnail(video_path: Path, thumb: Path, label: str) -> Path | None:
+    """为视频提取并缓存轻量 JPEG 封面图（解决 4K HEVC .mov 在浏览器中黑屏及成片封面展示）。"""
+    if not video_path.is_file():
+        return None
+    try:
+        v_mtime = video_path.stat().st_mtime
+        if thumb.is_file() and thumb.stat().st_size > 0 and thumb.stat().st_mtime >= v_mtime:
+            return thumb
+    except OSError:
+        pass
+
+    tmp_thumb = thumb.with_name(f"_tmp_{label}_{uuid.uuid4().hex[:6]}.jpg")
+    ffmpeg_exe = resolve_ffmpeg_exe()
+    for seek_pos in ("0.5", "0"):
+        try:
+            res = subprocess.run(
+                [
+                    ffmpeg_exe,
+                    "-y",
+                    "-analyzeduration",
+                    "2000000",
+                    "-probesize",
+                    "2000000",
+                    "-ss",
+                    seek_pos,
+                    "-i",
+                    str(video_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale='min(480,iw)':-2",
+                    "-q:v",
+                    "4",
+                    str(tmp_thumb),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0 and tmp_thumb.is_file() and tmp_thumb.stat().st_size > 0:
+                os.replace(tmp_thumb, thumb)
+                return thumb
+        except Exception:
+            pass
+        finally:
+            tmp_thumb.unlink(missing_ok=True)
+    return None
+
+
+def _ensure_model_thumbnail(model_id: int, video_path: Path) -> Path | None:
+    return _extract_video_thumbnail(video_path, _model_thumb_path(model_id), f"m{model_id}")
+
+
+def _ensure_video_thumbnail(job_id: int, video_path: Path) -> Path | None:
+    return _extract_video_thumbnail(video_path, _video_thumb_path(job_id), f"v{job_id}")
+
+
 def _resolve_model_files(row: dict[str, Any]) -> dict[str, Any]:
     output_root = resolve_output_root()
     voice_root = resolve_voice_root()
@@ -144,14 +311,24 @@ def _resolve_model_files(row: dict[str, Any]) -> dict[str, Any]:
 
     video_exists = bool(video_abs and video_abs.is_file())
     audio_exists = bool(audio_abs and audio_abs.is_file())
-    video_size_mb = round(video_abs.stat().st_size / (1024 * 1024), 2) if video_exists and video_abs else 0.0
+    video_size_mb = 0.0
+    video_mtime = 0
+    if video_exists and video_abs:
+        try:
+            st = video_abs.stat()
+            video_size_mb = round(st.st_size / (1024 * 1024), 2)
+            video_mtime = int(st.st_mtime)
+        except OSError:
+            pass
 
     row["video_abs_path"] = str(video_abs) if video_abs else ""
     row["audio_abs_path"] = str(audio_abs) if audio_abs else ""
     row["video_exists"] = video_exists
     row["audio_exists"] = audio_exists
+    row["has_voice"] = bool(row.get("voice_id") and audio_exists)
     row["video_size_mb"] = video_size_mb
     row["preview_url"] = f"/api/v1/media/model/{row['id']}" if video_exists else ""
+    row["thumb_url"] = f"/api/v1/media/model/{row['id']}/thumb?v={video_mtime}" if video_exists else ""
     row["voice_preview_url"] = f"/api/v1/media/voice/{row['voice_id']}" if row.get("voice_id") and audio_exists else ""
     return row
 
@@ -180,7 +357,24 @@ def _enrich_job_row(row: dict[str, Any]) -> dict[str, Any]:
             upsert_job_meta(vid, delivered_path=str(delivered_path))
 
     playable_path = delivered_path or temp_video_path
-    size_mb = round(playable_path.stat().st_size / (1024 * 1024), 2) if playable_path else 0.0
+    size_mb = 0.0
+    playable_mtime = 0
+    if playable_path:
+        try:
+            st = playable_path.stat()
+            size_mb = round(st.st_size / (1024 * 1024), 2)
+            playable_mtime = int(st.st_mtime)
+        except OSError:
+            pass
+
+    model_video_rel = str(row.get("model_video_path") or "").strip()
+    model_video_abs = (output_root / model_video_rel.lstrip("/\\")) if model_video_rel else None
+    model_video_exists = bool(model_video_abs and model_video_abs.is_file())
+    thumb_url = ""
+    if playable_path:
+        thumb_url = f"/api/v1/media/video/{vid}/thumb?v={playable_mtime}"
+    elif row.get("model_id") and model_video_exists:
+        thumb_url = f"/api/v1/media/model/{row['model_id']}/thumb"
 
     tts_params = {}
     try:
@@ -265,6 +459,7 @@ def _enrich_job_row(row: dict[str, Any]) -> dict[str, Any]:
         "file_size_mb": size_mb,
         "download_url": f"/api/v1/jobs/{vid}/download" if playable_path else "",
         "stream_url": f"/api/v1/media/video/{vid}" if playable_path else "",
+        "thumb_url": thumb_url,
     }
 
 
@@ -378,6 +573,12 @@ class OpenPathRequest(BaseModel):
     path: str
 
 
+class PickFileRequest(BaseModel):
+    kind: str = Field(default="video", pattern="^(video|audio)$")
+    multi: bool = False
+    initial_dir: str | None = None
+
+
 # ==================== System & Health Endpoints ====================
 
 @app.get("/api/v1/ping", tags=["系统状态"])
@@ -386,8 +587,22 @@ def api_ping() -> dict[str, Any]:
 
 
 @app.get("/api/v1/health", tags=["系统状态"], dependencies=[Depends(_verify_api_key)])
-def api_health(force: bool = Query(False)) -> dict[str, Any]:
-    return system_ctrl.get_system_health(force=force)
+def api_health(request: Request, force: bool = Query(False)) -> dict[str, Any]:
+    raw = system_ctrl.get_system_health(force=force)
+    res = dict(raw)
+    server_tuple = request.scope.get("server")
+    scope_port = int(server_tuple[1]) if (isinstance(server_tuple, tuple) and len(server_tuple) >= 2 and server_tuple[1]) else None
+    base_access = raw.get("access")
+    if scope_port and scope_port != 80 and base_access and int(base_access.get("port") or 0) != scope_port and not os.getenv("HEYGEM_STUDIO_PORT"):
+        access = dict(system_ctrl.get_network_access_info(port=scope_port))
+    else:
+        access = dict(base_access or system_ctrl.get_network_access_info())
+    is_local = _is_local_client(request)
+    access["client_is_local"] = is_local
+    access["client_mode"] = "local" if is_local else "remote"
+    access["desktop_tools_supported"] = (os.name == "nt")
+    res["access"] = access
+    return res
 
 
 @app.get("/api/v1/logs", tags=["系统状态"], dependencies=[Depends(_verify_api_key)])
@@ -433,11 +648,46 @@ def api_tts_mode(req: TtsModeRequest) -> dict[str, Any]:
 
 
 @app.post("/api/v1/system/open-path", tags=["系统控制"], dependencies=[Depends(_verify_api_key)])
-def api_open_path(req: OpenPathRequest) -> dict[str, Any]:
+def api_open_path(request: Request, req: OpenPathRequest) -> dict[str, Any]:
+    _require_local_client(request, "打开文件夹")
     ok, msg = system_ctrl.open_path_in_explorer(req.path)
     if not ok:
         raise HTTPException(status_code=404, detail=msg)
     return {"ok": True, "message": msg}
+
+
+@app.post("/api/v1/system/open-media", tags=["系统控制"], dependencies=[Depends(_verify_api_key)])
+def api_open_media(request: Request, req: OpenPathRequest) -> dict[str, Any]:
+    """用 Windows 本机默认播放器打开视频/音频文件（仅限本机访问且严格白名单后缀，用于播放浏览器不支持解码的 HEVC .mov）。"""
+    _require_local_client(request, "调用本机播放器")
+    cleaned = clean_local_path(req.path)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="媒体路径为空")
+    p = Path(cleaned)
+    if p.suffix.lower() not in (system_ctrl.VIDEO_EXTS | system_ctrl.AUDIO_EXTS):
+        raise HTTPException(status_code=400, detail=f"仅支持打开音视频文件，不支持后缀：{p.suffix or '(无后缀)'}")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail=f"媒体文件不存在：{p}")
+    ok, msg = system_ctrl.open_media_in_player(str(p))
+    if not ok:
+        raise HTTPException(status_code=500, detail=msg)
+    return {"ok": True, "message": msg}
+
+
+@app.post("/api/v1/system/pick-file", tags=["系统控制"], dependencies=[Depends(_verify_api_key)])
+def api_pick_file(request: Request, req: PickFileRequest | None = Body(default=None)) -> dict[str, Any]:
+    """呼出 Windows 本机文件选择弹窗，直接返回选中文件的本机路径（仅限本机访问，大视频无需经浏览器上传）。"""
+    _require_local_client(request, "弹出文件选择窗口")
+    effective = req or PickFileRequest()
+    res = system_ctrl.pick_local_files(
+        kind=effective.kind,
+        multi=effective.multi,
+        initial_dir=effective.initial_dir,
+    )
+    if not res.get("ok"):
+        code = 409 if res.get("busy") else 500
+        raise HTTPException(status_code=code, detail=res.get("detail") or "无法打开文件选择窗口")
+    return res
 
 
 # ==================== Categories & Model Groups ====================
@@ -599,14 +849,74 @@ def api_list_models(group_id: str | None = None, q: str | None = None) -> dict[s
         conn.close()
 
 
+@app.get("/api/v1/models/discover-local", tags=["模特与音色"], dependencies=[Depends(_verify_api_key)])
+def api_discover_local_models(directory: str | None = None) -> dict[str, Any]:
+    """轻量扫描本机预设拍摄目录中的视频文件，方便新手一键导入为数字人。"""
+    discovered = system_ctrl.discover_local_model_videos(directory=directory)
+    existing_valid_names: set[str] = set()
+    conn = get_conn()
+    try:
+        output_root = resolve_output_root()
+        for r in conn.execute("SELECT name, video_path FROM f2f_model").fetchall():
+            vp = str(r["video_path"] or "").strip()
+            if vp and (output_root / vp.lstrip("/\\")).is_file():
+                existing_valid_names.add(str(r["name"] or "").strip().lower())
+    finally:
+        conn.close()
+
+    for it in discovered["items"]:
+        it["already_imported"] = str(it.get("name") or "").strip().lower() in existing_valid_names
+    return discovered
+
+
+@app.post("/api/v1/models/cleanup-missing", tags=["模特与音色"], dependencies=[Depends(_verify_api_key)])
+def api_cleanup_missing_models() -> dict[str, Any]:
+    """一键清理所有底模视频文件已丢失的历史失效模特记录（保留历史成片与声音库，不删任何活跃任务对应模特）。"""
+    output_root = resolve_output_root()
+    deleted_ids: list[int] = []
+    skipped_active_ids: list[int] = []
+
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT id, video_path FROM f2f_model").fetchall()
+        for r in rows:
+            mid = int(r["id"])
+            vp = str(r["video_path"] or "").strip()
+            if vp and (output_root / vp.lstrip("/\\")).is_file():
+                continue
+            active = conn.execute(
+                "SELECT COUNT(*) FROM video WHERE model_id=? AND status IN ('pending', 'waiting')",
+                (mid,),
+            ).fetchone()[0]
+            if active:
+                skipped_active_ids.append(mid)
+                continue
+            conn.execute("DELETE FROM f2f_model WHERE id=?", (mid,))
+            deleted_ids.append(mid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    for mid in deleted_ids:
+        _remove_model_thumbnail(mid)
+
+    system_ctrl.invalidate_health_cache()
+    return {
+        "ok": True,
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "skipped_active_ids": skipped_active_ids,
+    }
+
+
 @app.post("/api/v1/models", tags=["模特与音色"], dependencies=[Depends(_verify_api_key)])
 def api_create_model(
-    name: str = Form(...),
+    name: str = Form(default=""),
     group_id: int | None = Form(default=None),
     local_video_path: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
 ) -> dict[str, Any]:
-    """导入新数字人模特（支持网页上传 MP4/MOV 或直接指定本机视频路径），自动提取参考音频并注册音色。"""
+    """导入新数字人模特（支持网页上传 MP4/MOV 或直接指定本机视频路径），自动提取参考音频并注册音色；无音轨视频也允许导入形象。"""
     cleaned_local = clean_local_path(local_video_path)
     if file is None and not cleaned_local:
         raise HTTPException(status_code=400, detail="请上传底模视频文件或填写本机视频路径")
@@ -618,56 +928,90 @@ def api_create_model(
     origin_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = time.strftime("%Y%m%d%H%M%S") + f"{int((time.time() % 1) * 1000):03d}"
+    fallback_stem = ""
+    probed_local: tuple[bool, bool] | None = None
 
-    if file is not None:
-        ext = Path(file.filename or "model.mp4").suffix.lower() or ".mp4"
-        if ext not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
-            raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
-        video_filename = f"{stamp}{ext}"
-        target_video = output_root / video_filename
-        with open(target_video, "wb") as out_fh:
-            shutil.copyfileobj(file.file, out_fh)
-    else:
-        src = Path(cleaned_local)
-        if not src.is_file():
-            raise HTTPException(status_code=404, detail=f"本机视频文件不存在：{src}")
-        ext = src.suffix.lower() or ".mp4"
-        if ext not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
-            raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
-        video_filename = f"{stamp}{ext}"
-        target_video = output_root / video_filename
-        shutil.copy2(src, target_video)
-
-    # 提取 22050Hz 单声道参考音色音频
-    raw_wav = origin_dir / f"{stamp}.wav"
-    fmt_wav = origin_dir / f"format_{stamp}.wav"
     try:
-        _convert_to_wav(target_video, raw_wav, sample_rate=22050)
-        shutil.copy2(raw_wav, fmt_wav)
+        if file is not None:
+            orig_p = Path(file.filename or "model.mp4")
+            fallback_stem = orig_p.stem
+            ext = orig_p.suffix.lower() or ".mp4"
+            if ext not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
+                raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
+            video_filename = f"{stamp}{ext}"
+            target_video = output_root / video_filename
+            with open(target_video, "wb") as out_fh:
+                shutil.copyfileobj(file.file, out_fh)
+        else:
+            src = Path(cleaned_local)
+            if not src.is_file():
+                raise HTTPException(status_code=404, detail=f"本机视频文件不存在：{src}")
+            fallback_stem = src.stem
+            ext = src.suffix.lower() or ".mp4"
+            if ext not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
+                raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
+            # 本机文件先探测再复制，避免把数 GB 损坏文件白拷一遍再报错
+            probed_local = _probe_media_streams(src)
+            if not probed_local[0]:
+                raise HTTPException(status_code=400, detail="所选文件不是有效的视频或文件已损坏，请换一个清晰的 MP4/MOV 视频")
+            video_filename = f"{stamp}{ext}"
+            target_video = output_root / video_filename
+            shutil.copy2(src, target_video)
+    except HTTPException:
+        raise
     except Exception as exc:
+        if "target_video" in locals():
+            target_video.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"写入视频文件失败：{exc}") from exc
+
+    final_name = (name or "").strip() or sanitize_filename(fallback_stem, f"人物_{stamp[-6:]}")
+    if not final_name:
         target_video.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"从底模视频提取参考音色失败（请确认视频包含音轨）：{exc}")
+        raise HTTPException(status_code=400, detail="人物名称不能为空")
+
+    # 上传文件落盘后探测视频有效性及是否含音轨
+    has_video, has_audio = probed_local if probed_local is not None else _probe_media_streams(target_video)
+    if not has_video:
+        target_video.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="所选文件不是有效的视频或文件已损坏，请换一个清晰的 MP4/MOV 视频")
 
     now_ms = int(time.time() * 1000)
-    origin_rel = f"origin_audio/{stamp}.wav"
-    fmt_abs_str = str(fmt_wav).replace("\\", "/")
+    voice_id: int | None = None
+    audio_rel_db = ""
+    raw_wav = origin_dir / f"{stamp}.wav"
+    fmt_wav = origin_dir / f"format_{stamp}.wav"
+
+    if has_audio:
+        try:
+            _convert_to_wav(target_video, raw_wav, sample_rate=22050)
+            shutil.copy2(raw_wav, fmt_wav)
+            audio_rel_db = f"origin_audio\\{stamp}.wav"
+        except Exception as exc:
+            target_video.unlink(missing_ok=True)
+            raw_wav.unlink(missing_ok=True)
+            fmt_wav.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"从底模视频提取参考音色失败：{exc}")
 
     conn = get_conn()
     try:
-        v_cur = conn.execute(
-            """
-            INSERT INTO voice (origin_audio_path, lang, asr_format_audio_url, reference_audio_text, created_at)
-            VALUES (?, 'zh', ?, '', ?)
-            """,
-            (origin_rel, fmt_abs_str, now_ms),
-        )
-        voice_id = int(v_cur.lastrowid)
+        if has_audio and audio_rel_db:
+            origin_rel = f"origin_audio/{stamp}.wav"
+            fmt_abs_str = str(fmt_wav).replace("\\", "/")
+            v_cur = conn.execute(
+                """
+                INSERT INTO voice (origin_audio_path, lang, asr_format_audio_url, reference_audio_text, created_at)
+                VALUES (?, 'zh', ?, '', ?)
+                """,
+                (origin_rel, fmt_abs_str, now_ms),
+            )
+            voice_id = int(v_cur.lastrowid)
+
         m_cur = conn.execute(
             """
             INSERT INTO f2f_model (name, video_path, audio_path, voice_id, created_at, group_id)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (name.strip(), video_filename, f"origin_audio\\{stamp}.wav", voice_id, now_ms, group_id),
+            (final_name, video_filename, audio_rel_db, voice_id, now_ms, group_id),
         )
         model_id = int(m_cur.lastrowid)
         conn.commit()
@@ -675,7 +1019,14 @@ def api_create_model(
             "SELECT m.*, g.name AS group_name FROM f2f_model m LEFT JOIN model_group g ON g.id = m.group_id WHERE m.id=?",
             (model_id,),
         ).fetchone()
+        system_ctrl.invalidate_health_cache()
         return {"item": _resolve_model_files(dict(row))}
+    except Exception:
+        conn.rollback()
+        target_video.unlink(missing_ok=True)
+        raw_wav.unlink(missing_ok=True)
+        fmt_wav.unlink(missing_ok=True)
+        raise
     finally:
         conn.close()
 
@@ -704,6 +1055,7 @@ def api_relink_model_video(
     output_root.mkdir(parents=True, exist_ok=True)
     old_name = Path(str(model.get("video_path") or "").strip()).name
     allowed_exts = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+    has_audio = False
 
     if file is not None:
         ext = Path(file.filename or "model.mp4").suffix.lower() or ".mp4"
@@ -711,8 +1063,17 @@ def api_relink_model_video(
             raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
         new_name = old_name if (old_name and Path(old_name).suffix.lower() == ext) else f"{int(time.time()*1000)}{ext}"
         target = output_root / new_name
-        with open(target, "wb") as out_fh:
-            shutil.copyfileobj(file.file, out_fh)
+        tmp_target = output_root / f"_relink_tmp_{uuid.uuid4().hex[:8]}{ext}"
+        try:
+            with open(tmp_target, "wb") as out_fh:
+                shutil.copyfileobj(file.file, out_fh)
+            has_video, has_audio = _probe_media_streams(tmp_target)
+            if not has_video:
+                raise HTTPException(status_code=400, detail="所选文件不是有效的视频或文件已损坏")
+            os.replace(tmp_target, target)
+        except Exception:
+            tmp_target.unlink(missing_ok=True)
+            raise
     else:
         src = Path(cleaned_local)
         if not src.is_file():
@@ -720,24 +1081,86 @@ def api_relink_model_video(
         ext = src.suffix.lower() or ".mp4"
         if ext not in allowed_exts:
             raise HTTPException(status_code=400, detail=f"不支持的视频格式：{ext}")
+        # 本机文件先探测再复制，避免损坏大文件白拷贝
+        has_video, has_audio = _probe_media_streams(src)
+        if not has_video:
+            raise HTTPException(status_code=400, detail="所选文件不是有效的视频或文件已损坏")
         new_name = old_name if (old_name and Path(old_name).suffix.lower() == ext) else f"{int(time.time()*1000)}{ext}"
         target = output_root / new_name
-        shutil.copy2(src, target)
+        tmp_target = output_root / f"_relink_tmp_{uuid.uuid4().hex[:8]}{ext}"
+        try:
+            shutil.copy2(src, tmp_target)
+            os.replace(tmp_target, target)
+        except Exception:
+            tmp_target.unlink(missing_ok=True)
+            raise
 
-    # 若关联音色文件不存在，尝试从新底模视频自动补提参考音色（静默容错）
+    _remove_model_thumbnail(model_id)
+
+    # 补提参考音色：1) 原已绑定 audio_path 但文件缺失 -> 补提；2) 原为静音无音色 -> 新视频有声时自动建音色并绑定
+    voice_root = resolve_voice_root()
+    origin_dir = voice_root / "origin_audio"
+    origin_dir.mkdir(parents=True, exist_ok=True)
     audio_rel = str(model.get("audio_path") or "").strip()
-    if audio_rel:
-        voice_root = resolve_voice_root()
-        audio_abs = Path(audio_rel) if Path(audio_rel).is_absolute() else (voice_root / audio_rel.lstrip("/\\"))
-        if not audio_abs.is_file():
+    new_audio_rel_db: str | None = None
+    new_voice_origin_rel: str | None = None
+    new_voice_fmt_abs: str | None = None
+
+    if has_audio:
+        if audio_rel:
+            audio_abs = Path(audio_rel) if Path(audio_rel).is_absolute() else (voice_root / audio_rel.lstrip("/\\"))
+            if not audio_abs.is_file():
+                try:
+                    _convert_to_wav(target, audio_abs, sample_rate=22050)
+                    fmt_sibling = audio_abs.with_name(f"format_{audio_abs.name}")
+                    if not fmt_sibling.is_file():
+                        shutil.copy2(audio_abs, fmt_sibling)
+                except Exception:
+                    pass
+        if not model.get("voice_id") or not audio_rel:
+            stamp = time.strftime("%Y%m%d%H%M%S") + f"{int((time.time() % 1) * 1000):03d}"
+            raw_wav = origin_dir / f"{stamp}.wav"
+            fmt_wav = origin_dir / f"format_{stamp}.wav"
             try:
-                _convert_to_wav(target, audio_abs, sample_rate=22050)
+                _convert_to_wav(target, raw_wav, sample_rate=22050)
+                shutil.copy2(raw_wav, fmt_wav)
+                new_audio_rel_db = f"origin_audio\\{stamp}.wav"
+                new_voice_origin_rel = f"origin_audio/{stamp}.wav"
+                new_voice_fmt_abs = str(fmt_wav).replace("\\", "/")
             except Exception:
-                pass
+                raw_wav.unlink(missing_ok=True)
+                fmt_wav.unlink(missing_ok=True)
 
     conn = get_conn()
     try:
-        conn.execute("UPDATE f2f_model SET video_path=? WHERE id=?", (new_name, model_id))
+        if new_audio_rel_db and new_voice_origin_rel and new_voice_fmt_abs:
+            v_cur = conn.execute(
+                """
+                INSERT INTO voice (origin_audio_path, lang, asr_format_audio_url, reference_audio_text, created_at)
+                VALUES (?, 'zh', ?, '', ?)
+                """,
+                (new_voice_origin_rel, new_voice_fmt_abs, int(time.time() * 1000)),
+            )
+            new_vid = int(v_cur.lastrowid)
+            conn.execute(
+                "UPDATE f2f_model SET video_path=?, audio_path=?, voice_id=? WHERE id=?",
+                (new_name, new_audio_rel_db, new_vid, model_id),
+            )
+        else:
+            conn.execute("UPDATE f2f_model SET video_path=? WHERE id=?", (new_name, model_id))
+
+        # 若更换了不同后缀的新文件，且没有其他模特引用旧视频文件，则安全清理旧孤儿文件
+        if old_name and old_name != new_name:
+            other_refs = conn.execute(
+                "SELECT COUNT(*) FROM f2f_model WHERE id<>? AND video_path=?",
+                (model_id, old_name),
+            ).fetchone()[0]
+            if not other_refs:
+                try:
+                    (output_root / old_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         conn.commit()
         refreshed = conn.execute(
             "SELECT m.*, g.name AS group_name FROM f2f_model m LEFT JOIN model_group g ON g.id = m.group_id WHERE m.id=?",
@@ -763,7 +1186,7 @@ def api_update_model(model_id: int, req: ModelUpdate) -> dict[str, Any]:
                 raise HTTPException(status_code=400, detail="模特名称不能为空")
             updates["name"] = clean_name
         if "group_id" in req.model_fields_set:
-            updates["group_id"] = req.group_id
+            updates["group_id"] = None if (req.group_id is None or req.group_id <= 0) else req.group_id
         if updates:
             sql = f"UPDATE f2f_model SET {', '.join(f'{k}=?' for k in updates)} WHERE id=?"
             conn.execute(sql, list(updates.values()) + [model_id])
@@ -789,6 +1212,7 @@ def api_delete_model(model_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail=f"该模特仍有 {active} 个正在排队/渲染中的任务，请先中断后再删除")
         conn.execute("DELETE FROM f2f_model WHERE id=?", (model_id,))
         conn.commit()
+        _remove_model_thumbnail(model_id)
         system_ctrl.invalidate_health_cache()
         return {"ok": True}
     finally:
@@ -946,7 +1370,7 @@ def api_tts_capabilities() -> dict[str, Any]:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig")) if cfg_path.exists() else {}
         return {
             "available": False,
-            "unavailable_reason": "IndexTTS2 适配器 (18180) 当前未启动，点击顶部「一键自愈恢复」即可拉起",
+            "unavailable_reason": "IndexTTS2 语音服务 (18180) 当前未启动，点击顶部「一键启动服务」即可后台拉起",
             "versions": ["IndexTTS-2", "IndexTTS-2.5"],
             "emo_vector_labels": ["喜", "怒", "哀", "惧", "厌恶", "低落", "惊喜", "平静"],
             "languages": ["ZH", "EN", "JA", "ES", "AR"],
@@ -1123,7 +1547,7 @@ def api_tts_synthesize(req: TtsSynthesizeRequest) -> dict[str, Any]:
             detail = err_body or str(exc)
         raise HTTPException(status_code=exc.code if 400 <= exc.code < 600 else 502, detail=detail)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"调用 IndexTTS2 合成失败：{exc}")
+        raise HTTPException(status_code=503, detail=_friendly_tts_conn_error(exc))
 
     audio_dir = resolve_studio_assets_root() / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -1475,7 +1899,7 @@ def _validate_and_prepare_job_spec(conn, item: JobCreateItem, index: int | None 
     if not video_abs or not video_abs.is_file():
         raise HTTPException(
             status_code=400,
-            detail=f"{prefix}数字人模特「{model['name']}」(ID={item.model_id}) 的底模视频文件缺失：{video_abs or vp or '(未配置)'}，请先在「模特与音色」页面重新关联或上传底模",
+            detail=f"{prefix}数字人模特「{model['name']}」(ID={item.model_id}) 的底模视频文件缺失：{video_abs or vp or '(未配置)'}，请先在「人物与声音」页面补回或重新导入底模",
         )
 
     text_content = (item.text or "").strip()
@@ -1512,7 +1936,7 @@ def _validate_and_prepare_job_spec(conn, item: JobCreateItem, index: int | None 
         if not voice_file or not voice_file.is_file():
             raise HTTPException(
                 status_code=400,
-                detail=f"{prefix}参考音色 ID={voice_id} 的音频文件缺失：{voice_file or '(未配置)'}，请先在「模特与音色」页面检查或重新上传音色",
+                detail=f"{prefix}参考音色 ID={voice_id} 的音频文件缺失：{voice_file or '(未配置)'}，请先在「人物与声音」页面检查或重新上传声音",
             )
 
         # 情感音频模式前置校验：若请求未显式传 emo_mode，同步参考全局 adapter/config.json 默认值
@@ -1926,27 +2350,234 @@ def api_delete_job(job_id: int, remove_files: bool = False) -> dict[str, Any]:
         conn.commit()
     finally:
         conn.close()
+    _remove_video_thumbnail(job_id)
+    _remove_compact_cache(job_id)
     return {"ok": True}
 
 
+class FastFileResponse(FileResponse):
+    """使用 4MB 大块传输替代默认的 64KB 小块，大幅减少大视频下载时的线程切换开销，同时完整保留 HTTP Range 断点续传。"""
+
+    chunk_size = 4 * 1024 * 1024
+
+
+_COMPACT_LOCK_GUARD = threading.Lock()
+_COMPACT_JOB_LOCKS: dict[int, threading.Lock] = {}
+
+
+def _get_compact_lock(job_id: int) -> threading.Lock:
+    with _COMPACT_LOCK_GUARD:
+        lock = _COMPACT_JOB_LOCKS.get(job_id)
+        if lock is None:
+            lock = threading.Lock()
+            _COMPACT_JOB_LOCKS[job_id] = lock
+        return lock
+
+
+def _pick_fastest_video_source(job: dict[str, Any]) -> Path | None:
+    """下载/流式读取时，若固态盘 D: 临时区存有同大小原件，则优先从固态盘读取避开机械硬盘慢速冷读。"""
+    paths = job.get("paths") or {}
+    delivered_raw = str(paths.get("delivered_path") or "").strip()
+    temp_raw = str(paths.get("temp_video_path") or "").strip()
+    playable_raw = str(paths.get("playable_path") or "").strip()
+
+    delivered = Path(delivered_raw) if delivered_raw else None
+    temp = Path(temp_raw) if temp_raw else None
+    if delivered and delivered.is_file() and temp and temp.is_file():
+        try:
+            if temp.stat().st_size == delivered.stat().st_size and temp.stat().st_size > 0:
+                return temp
+        except OSError:
+            pass
+    if playable_raw:
+        p = Path(playable_raw)
+        if p.is_file():
+            return p
+    return None
+
+
+def _remove_compact_cache(job_id: int) -> None:
+    compact_dir = resolve_studio_assets_root() / "compact"
+    if not compact_dir.is_dir():
+        return
+    for item in compact_dir.glob(f"job_{job_id}_*.mp4"):
+        try:
+            item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _ensure_compact_video(job_id: int, source: Path) -> tuple[Path, bool]:
+    """用 RTX 4070 NVENC 硬件加速（失败自动回退 libx264）生成清晰 1080p 小体积版并缓存，绝不改动原 4K 成片。"""
+    st = source.stat()
+    orig_mb = st.st_size / (1024 * 1024)
+    meta = probe_media_info(source)
+    w = int(meta.get("width") or 0)
+    h = int(meta.get("height") or 0)
+    short_edge = min(w, h) if (w > 0 and h > 0) else 0
+    if orig_mb <= 80.0 and (short_edge == 0 or short_edge <= 1080):
+        return source, True
+
+    compact_dir = resolve_studio_assets_root() / "compact"
+    compact_dir.mkdir(parents=True, exist_ok=True)
+    target = compact_dir / f"job_{job_id}_{int(st.st_mtime)}_{st.st_size}.mp4"
+
+    lock = _get_compact_lock(job_id)
+    with lock:
+        if target.is_file() and target.stat().st_size > 0:
+            return target, False
+
+        # 清理该任务旧缓存
+        for old in compact_dir.glob(f"job_{job_id}_*.mp4"):
+            if old != target:
+                try:
+                    old.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        ffmpeg_exe = resolve_ffmpeg_exe()
+        # 无论横屏还是竖屏，统一按最长边 <= 1920、短边 <= 1080 等比缩放并保持偶数分辨率
+        scale_filter = "scale='if(gt(iw,ih),min(1920,iw),-2)':'if(gt(iw,ih),-2,min(1920,ih))'"
+        tmp_out = compact_dir / f"_tmp_{job_id}_{uuid.uuid4().hex[:6]}.mp4"
+
+        encoder_attempts = [
+            [
+                ffmpeg_exe, "-y", "-i", str(source),
+                "-vf", scale_filter,
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "24", "-b:v", "0", "-maxrate", "8M", "-bufsize", "16M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(tmp_out),
+            ],
+            [
+                ffmpeg_exe, "-y", "-i", str(source),
+                "-vf", scale_filter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-maxrate", "8M", "-bufsize", "16M",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(tmp_out),
+            ],
+        ]
+
+        last_err = ""
+        for cmd in encoder_attempts:
+            tmp_out.unlink(missing_ok=True)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
+                os.replace(tmp_out, target)
+                return target, False
+            last_err = (res.stderr or res.stdout or "").strip()[-300:]
+
+        tmp_out.unlink(missing_ok=True)
+        raise RuntimeError(f"压缩轻量版视频失败：{last_err or 'FFmpeg 退出异常'}")
+
+
 @app.get("/api/v1/jobs/{job_id}/download", tags=["数字人任务与自动化 API"])
-def api_download_job(job_id: int) -> FileResponse:
+def api_download_job(
+    job_id: int,
+    quality: str = Query("original", pattern="^(original|compact)$"),
+) -> FileResponse:
     job = _fetch_job_by_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    target = Path(job["paths"].get("playable_path") or "")
-    if not target.is_file():
+    source = _pick_fastest_video_source(job)
+    if not source or not source.is_file():
         raise HTTPException(status_code=404, detail="成片视频文件尚未生成或已移动")
-    dl_name = f"{job_id:04d}_{sanitize_filename(job['name'], 'video')}.mp4"
-    return FileResponse(
+
+    base_name = f"{job_id:04d}_{sanitize_filename(job['name'], 'video')}"
+    if quality == "compact":
+        try:
+            target, reused = _ensure_compact_video(job_id, source)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        dl_name = f"{base_name}.mp4" if reused else f"{base_name}_轻量1080p.mp4"
+    else:
+        target = source
+        dl_name = f"{base_name}.mp4"
+
+    return FastFileResponse(
         path=str(target),
         media_type="video/mp4",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(dl_name)}"},
     )
 
 
+@app.post("/api/v1/jobs/{job_id}/copy-file", tags=["数字人任务与自动化 API"], dependencies=[Depends(_verify_api_key)])
+def api_copy_job_file(
+    request: Request,
+    job_id: int,
+    quality: str = Query("original", pattern="^(original|compact)$"),
+) -> dict[str, Any]:
+    _require_local_client(request, "复制视频文件到剪贴板")
+    job = _fetch_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    raw_target = str((job.get("paths") or {}).get("playable_path") or "").strip()
+    source = Path(raw_target) if raw_target else None
+    if not source or not source.is_file():
+        raise HTTPException(status_code=404, detail="成片视频文件尚未生成或已移动")
+
+    target = source
+    if quality == "compact":
+        try:
+            target, _ = _ensure_compact_video(job_id, source)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    ok, msg = system_ctrl.copy_file_to_clipboard(str(target))
+    if not ok:
+        raise HTTPException(status_code=500, detail=msg)
+    return {"ok": True, "path": str(target), "message": msg}
+
+
+@app.post("/api/v1/jobs/{job_id}/compact", tags=["数字人任务与自动化 API"], dependencies=[Depends(_verify_api_key)])
+def api_compact_job_video(request: Request, job_id: int) -> dict[str, Any]:
+    """用显卡高速生成清晰 1080p 小体积版（保留原 4K 大片），本机访问时顺带自动复制到剪贴板方便直接粘贴发微信。"""
+    job = _fetch_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    source = _pick_fastest_video_source(job)
+    if not source or not source.is_file():
+        raise HTTPException(status_code=404, detail="成片视频文件尚未生成或已移动")
+
+    orig_mb = round(source.stat().st_size / (1024 * 1024), 1)
+    t0 = time.time()
+    try:
+        compact_path, reused = _ensure_compact_video(job_id, source)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    elapsed = round(time.time() - t0, 1)
+    compact_mb = round(compact_path.stat().st_size / (1024 * 1024), 1)
+
+    copied = False
+    if _is_local_client(request) and os.name == "nt":
+        copied, _ = system_ctrl.copy_file_to_clipboard(str(compact_path))
+
+    return {
+        "ok": True,
+        "path": str(compact_path),
+        "orig_size_mb": orig_mb,
+        "compact_size_mb": compact_mb,
+        "elapsed_seconds": elapsed,
+        "reused_original": reused,
+        "copied_to_clipboard": copied,
+        "download_url": f"/api/v1/jobs/{job_id}/download?quality=compact",
+    }
+
+
 @app.post("/api/v1/jobs/{job_id}/open-folder", tags=["数字人任务与自动化 API"], dependencies=[Depends(_verify_api_key)])
-def api_open_job_folder(job_id: int) -> dict[str, Any]:
+def api_open_job_folder(request: Request, job_id: int) -> dict[str, Any]:
+    _require_local_client(request, "打开文件夹")
     job = _fetch_job_by_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -1959,15 +2590,58 @@ def api_open_job_folder(job_id: int) -> dict[str, Any]:
 
 # ==================== Media Streaming Endpoints (Supports HTTP Range) ====================
 
+@app.get("/api/v1/media/video/{job_id}/thumb", tags=["媒体预览"])
+def media_video_thumbnail(job_id: int) -> FileResponse:
+    """返回成品视频的轻量 JPEG 封面缩略图（若成片已移走则自动回退人物底模封面）。"""
+    job = _fetch_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    raw_playable = str(job["paths"].get("playable_path") or "").strip()
+    if raw_playable:
+        target = Path(raw_playable)
+        if target.is_file():
+            thumb = _ensure_video_thumbnail(job_id, target)
+            if thumb and thumb.is_file():
+                return FileResponse(path=str(thumb), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    model_id = job.get("model_id")
+    raw_model = str(job["paths"].get("model_video_path") or "").strip()
+    if model_id and raw_model:
+        model_path = Path(raw_model)
+        if model_path.is_file():
+            thumb = _ensure_model_thumbnail(int(model_id), model_path)
+            if thumb and thumb.is_file():
+                return FileResponse(path=str(thumb), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    raise HTTPException(status_code=404, detail="无法提取视频封面")
+
+
 @app.get("/api/v1/media/video/{job_id}", tags=["媒体预览"])
 def media_stream_video(job_id: int) -> FileResponse:
     job = _fetch_job_by_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    target = Path(job["paths"].get("playable_path") or "")
-    if not target.is_file():
+    target = _pick_fastest_video_source(job)
+    if not target or not target.is_file():
         raise HTTPException(status_code=404, detail="视频文件不存在")
-    return FileResponse(path=str(target), media_type="video/mp4")
+    return FastFileResponse(path=str(target), media_type="video/mp4")
+
+
+@app.get("/api/v1/media/model/{model_id}/thumb", tags=["媒体预览"])
+def media_model_thumbnail(model_id: int) -> FileResponse:
+    """返回人物底模视频的轻量 JPEG 封面缩略图（自动缓存，解决 HEVC 10-bit .mov 在浏览器中黑屏问题）。"""
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT video_path FROM f2f_model WHERE id=?", (model_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["video_path"]:
+        raise HTTPException(status_code=404, detail="模特不存在")
+    target = resolve_output_root() / str(row["video_path"]).lstrip("/\\")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="底模视频文件不存在")
+    thumb = _ensure_model_thumbnail(model_id, target)
+    if not thumb or not thumb.is_file():
+        raise HTTPException(status_code=404, detail="无法提取视频缩略图")
+    return FileResponse(path=str(thumb), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/api/v1/media/model/{model_id}", tags=["媒体预览"])
@@ -2013,6 +2687,64 @@ def media_stream_voice(voice_id: int) -> FileResponse:
     return FileResponse(path=str(target), media_type="audio/wav")
 
 
+# ==================== 云端数字人成片自动拉回本地 ====================
+
+
+class CloudSyncConfigRequest(BaseModel):
+    enabled: bool | None = None
+    cloud_url: str | None = None
+    cloud_token: str | None = None
+    save_dir: str | None = None
+    quality: str | None = None
+    poll_interval: int | None = None
+    notify_desktop: bool | None = None
+
+
+class CloudSyncOpenFolderRequest(BaseModel):
+    file_path: str | None = None
+
+
+@app.get("/api/v1/cloud-sync/status", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def get_cloud_sync_status() -> dict[str, Any]:
+    return {"ok": True, "status": cloud_sync_manager.get_status()}
+
+
+@app.post("/api/v1/cloud-sync/config", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def update_cloud_sync_config(req: CloudSyncConfigRequest) -> dict[str, Any]:
+    try:
+        st = cloud_sync_manager.update_config(
+            enabled=req.enabled,
+            cloud_url=req.cloud_url,
+            cloud_token=req.cloud_token,
+            save_dir=req.save_dir,
+            quality=req.quality,
+            poll_interval=req.poll_interval,
+            notify_desktop=req.notify_desktop,
+        )
+        return {"ok": True, "status": st}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"保存云端同步配置失败：{exc}") from exc
+
+
+@app.post("/api/v1/cloud-sync/sync-now", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def trigger_cloud_sync_now() -> dict[str, Any]:
+    st = cloud_sync_manager.get_status()
+    if not st.get("cloud_url"):
+        raise HTTPException(status_code=400, detail="请先填写并保存 Colab 云端创作台网址")
+    threading.Thread(target=cloud_sync_manager.sync_once, name="CloudSyncManual", daemon=True).start()
+    return {"ok": True, "message": "已立即在后台检查云端新成片"}
+
+
+@app.post("/api/v1/cloud-sync/open-folder", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def open_cloud_sync_folder(req: CloudSyncOpenFolderRequest = Body(default=CloudSyncOpenFolderRequest())) -> dict[str, Any]:
+    st = cloud_sync_manager.get_status()
+    target = Path(req.file_path) if (req.file_path and Path(req.file_path).exists()) else Path(st.get("save_dir") or r"E:\数字人视频文件")
+    if not target.exists():
+        target.mkdir(parents=True, exist_ok=True)
+    ok, msg = system_ctrl.open_path_in_explorer(str(target))
+    return {"ok": ok, "message": msg, "path": str(target)}
+
+
 # ==================== Static Web Studio UI ====================
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -2029,13 +2761,13 @@ def serve_index() -> HTMLResponse:
     index_file = STATIC_DIR / "index.html"
     if not index_file.exists():
         return HTMLResponse("<h1>HeyGem Studio UI 尚未初始化</h1>", status_code=503)
-    return HTMLResponse(index_file.read_text(encoding="utf-8"))
+    return HTMLResponse(index_file.read_text(encoding="utf-8"), headers={"Cache-Control": "no-cache"})
 
 
 def run_server() -> None:
     import uvicorn
 
-    host = os.getenv("HEYGEM_STUDIO_HOST", "127.0.0.1")
+    host = os.getenv("HEYGEM_STUDIO_HOST", "0.0.0.0")
     port = int(os.getenv("HEYGEM_STUDIO_PORT", "8390"))
     uvicorn.run(app, host=host, port=port, log_level="info")
 

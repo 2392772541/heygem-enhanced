@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright
 PROJECT_ROOT = Path(r"D:\HeyGem-Enhanced")
 ADAPTER_PY = Path(r"D:\HeyGem\tts-story-f5\venv\Scripts\python.exe")
 ADAPTER_SCRIPT = PROJECT_ROOT / "adapter" / "heygem_index_tts2_adapter.py"
-SCREENSHOT_DIR = Path(r"C:\Users\win10\.gemini\antigravity\brain\982ed88e-8510-48d8-95dd-7f4181192266")
+SCREENSHOT_DIR = PROJECT_ROOT / "logs" / "audit_shots"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -146,6 +146,7 @@ def main() -> int:
 
         # 4. Real Playwright Headless Browser UI Audit
         print("\n=== 3. Playwright Human-Perspective Browser Audit ===")
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         console_errors = []
         page_errors = []
         failed_requests = []
@@ -166,39 +167,58 @@ def main() -> int:
             page.on("response", lambda r: failed_requests.append(f"{r.status} {r.url}") if r.status >= 400 else None)
 
             page.goto("http://127.0.0.1:8390", wait_until="networkidle")
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(900)
 
-            # Check Create view + toggle 8-dim emotion sliders
-            page.click('#emoModeTabs button[data-emo="emo_vector"]')
-            page.wait_for_timeout(300)
-            assert page.locator("#emoVectorBox .emo-slider").count() == 8
+            # 1) Create workspace: verify 3-column non-scrolling workbench & script entry
+            assert page.locator("#view-create.active").count() == 1
+            assert page.locator("#btnSubmitTtsVideo").is_visible()
+            page.fill("#ttsTextInput", "大家好，欢迎体验全新的可视化数字人工作台。")
+            page.wait_for_timeout(200)
             page.screenshot(path=str(SCREENSHOT_DIR / "audit_01_create.png"))
 
-            # Switch to Tasks view
+            # 2) Independent Voice Studio view: verify synced script & 8-dim emotion sliders
+            page.click('.nav-btn[data-view="voice"]')
+            page.wait_for_timeout(450)
+            assert page.input_value("#voiceTextInput").startswith("大家好")
+            page.click('#emoModeTabs button[data-emo="emo_vector"]')
+            page.wait_for_timeout(250)
+            assert page.locator("#emoVectorBox .emo-slider").count() == 8
+            page.screenshot(path=str(SCREENSHOT_DIR / "audit_02_voice.png"))
+
+            # 3) Tasks view
             page.click('.nav-btn[data-view="tasks"]')
             page.wait_for_timeout(500)
             tasks_cnt = page.locator("#tasksList .job-card").count()
             print(f"Tasks view rendered {tasks_cnt} job cards")
-            page.screenshot(path=str(SCREENSHOT_DIR / "audit_02_tasks.png"))
+            page.screenshot(path=str(SCREENSHOT_DIR / "audit_03_tasks.png"))
 
-            # Switch to Library view
+            # 4) Library view (with cover thumbnails)
             page.click('.nav-btn[data-view="library"]')
-            page.wait_for_timeout(500)
-            lib_cnt = page.locator("#libraryGrid .card").count()
+            page.wait_for_timeout(600)
+            lib_cnt = page.locator("#libraryGrid .media-card").count()
             print(f"Library view rendered {lib_cnt} video cards")
-            page.screenshot(path=str(SCREENSHOT_DIR / "audit_03_library.png"))
+            page.screenshot(path=str(SCREENSHOT_DIR / "audit_04_library.png"))
 
-            # Switch to Models view
+            # 5) Models & Voices view
             page.click('.nav-btn[data-view="models"]')
             page.wait_for_timeout(500)
-            models_cnt = page.locator("#modelsManageGrid .card").count()
+            models_cnt = page.locator("#modelsManageGrid .media-card").count()
             print(f"Models view rendered {models_cnt} model cards")
+            page.screenshot(path=str(SCREENSHOT_DIR / "audit_05_models.png"))
 
-            # Switch to Automation API view and click live test button
-            page.click('.nav-btn[data-view="api"]')
-            page.wait_for_timeout(400)
+            # 6) System & Services view (access info + logs + collapsible developer API tester)
+            page.click('.nav-btn[data-view="system"]')
+            page.wait_for_timeout(600)
+            assert "127.0.0.1" in (page.locator("#sysLocalUrl").text_content() or "")
+            logs_txt = page.locator("#logsConsole").text_content() or ""
+            assert len(logs_txt) > 0
+            page.screenshot(path=str(SCREENSHOT_DIR / "audit_06_system.png"))
+
+            # Expand optional developer drawer and test GET /api/v1/health
+            page.click("#devApiDrawer > summary")
+            page.wait_for_timeout(300)
             page.click("text=填充: 健康检查")
-            page.click("text=▶ 发送真实请求")
+            page.click("text=发送测试请求")
             page.wait_for_function(
                 "() => (document.getElementById('apiTestResponse')?.textContent || '').includes('overall')",
                 timeout=10000,
@@ -206,13 +226,6 @@ def main() -> int:
             api_resp_text = page.locator("#apiTestResponse").text_content() or ""
             assert '"overall"' in api_resp_text, f"API tester failed: {api_resp_text[:200]}"
             print("Online API tester live GET /api/v1/health PASSED")
-
-            # Open Logs modal
-            page.click("text=📜 实时日志")
-            page.wait_for_timeout(800)
-            logs_txt = page.locator("#logsConsole").text_content() or ""
-            assert len(logs_txt) > 0
-            page.click("#logsModal button:has-text('✕ 关闭')")
 
             browser.close()
 
