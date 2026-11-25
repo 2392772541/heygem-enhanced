@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import json
 import os
@@ -19,6 +20,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,72 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "logs" / "cloud_sync_state.json"
 DEFAULT_SAVE_DIR = Path(r"E:\数字人视频文件")
+DEFAULT_COLAB_AUTH_FILE = Path.home() / ".ssh" / "colab_hub_auth.json"
+
+
+def _is_fixed_gateway_url(url: str) -> bool:
+    """判断目标地址是否为腾讯云固定域名网关（需要 HTTP Basic Auth）。"""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "gz.grzdt.com" or host.endswith(".grzdt.com"):
+        return True
+    gw = os.environ.get("COLAB_GATEWAY_URL", "").strip()
+    if gw:
+        gw_p = urllib.parse.urlparse(gw)
+        if gw_p.netloc and parsed.netloc.lower() == gw_p.netloc.lower():
+            return True
+    return False
+
+
+def _load_colab_basic_auth() -> tuple[str, str] | None:
+    """读取本机私有网关 Basic Auth 凭据（环境变量或 ~/.ssh/colab_hub_auth.json）。"""
+    env_pass = os.environ.get("COLAB_HUB_PASS", "")
+    env_user = os.environ.get("COLAB_HUB_USER", "").strip() or "admin"
+    if env_pass:
+        return env_user, env_pass
+    auth_path_env = os.environ.get("COLAB_HUB_AUTH_FILE", "").strip()
+    auth_path = Path(auth_path_env) if auth_path_env else DEFAULT_COLAB_AUTH_FILE
+    if not auth_path.is_file():
+        return None
+    try:
+        raw = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            pwd = str(raw.get("password") or raw.get("pass") or "")
+            user = str(raw.get("user") or raw.get("username") or "admin").strip() or "admin"
+            if pwd:
+                return user, pwd
+    except Exception:
+        return None
+    return None
+
+
+def _join_cloud_url(cloud_url: str, rel_or_abs: str) -> str:
+    """安全拼接带路径前缀（如 /heygem）的固定域名与后端相对路径，避免前缀重复。"""
+    target = (rel_or_abs or "").strip()
+    if target.startswith(("http://", "https://")):
+        return target
+    base = (cloud_url or "").strip().rstrip("/")
+    rel = "/" + target.lstrip("/")
+    parsed_base = urllib.parse.urlparse(base)
+    base_path = parsed_base.path.rstrip("/")
+    if base_path and (rel == base_path or rel.startswith(base_path + "/")):
+        return f"{parsed_base.scheme}://{parsed_base.netloc}{rel}"
+    return f"{base}{rel}"
+
+
+def _append_query_token(url: str, token: str) -> str:
+    """在固定域名网关模式下把内部可选 token 放入查询参数（避开 Caddy 剥离 Authorization 头）。"""
+    tok = (token or "").strip()
+    if not tok:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if any(k == "token" for k, _ in pairs):
+        return url
+    pairs.append(("token", tok))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(pairs), parsed.fragment)
+    )
 
 
 def _safe_filename(name: str, fallback: str = "video") -> str:
@@ -126,6 +194,7 @@ class CloudAutoSyncManager:
         self._runtime: dict[str, Any] = {
             "connected": False,
             "cloud_video_count": 0,
+            "cloud_videos": [],
             "last_check_at": 0.0,
             "last_error": "",
             "active_download": None,
@@ -254,6 +323,7 @@ class CloudAutoSyncManager:
                 "notify_desktop": bool(self._config.get("notify_desktop", True)),
                 "connected": bool(self._runtime.get("connected")),
                 "cloud_video_count": int(self._runtime.get("cloud_video_count") or 0),
+                "cloud_videos": list(self._runtime.get("cloud_videos") or []),
                 "last_check_at": float(self._runtime.get("last_check_at") or 0.0),
                 "last_error": self._runtime.get("last_error") or "",
                 "active_download": self._runtime.get("active_download"),
@@ -269,6 +339,27 @@ class CloudAutoSyncManager:
             urllib.request.build_opener(),
         ]
 
+    def _prepare_request(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        """统一补齐网关 Basic Auth 与可选内部 token（兼容固定域名与临时链接）。"""
+        req_headers = dict(headers or {})
+        tok = (self._config.get("cloud_token") or "").strip()
+        final_url = url
+        if _is_fixed_gateway_url(url):
+            creds = _load_colab_basic_auth()
+            if creds and "Authorization" not in req_headers:
+                user, pwd = creds
+                raw_b64 = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+                req_headers["Authorization"] = f"Basic {raw_b64}"
+            if tok:
+                final_url = _append_query_token(final_url, tok)
+        elif tok and "Authorization" not in req_headers:
+            req_headers["Authorization"] = f"Bearer {tok}"
+        return final_url, req_headers
+
     def _http_request(
         self,
         url: str,
@@ -278,20 +369,17 @@ class CloudAutoSyncManager:
         headers: dict[str, str] | None = None,
         timeout: int = 20,
     ) -> tuple[int, dict[str, str], bytes, urllib.request.OpenerDirector]:
-        req_headers = dict(headers or {})
-        tok = (self._config.get("cloud_token") or "").strip()
-        if tok:
-            req_headers["Authorization"] = f"Bearer {tok}"
+        final_url, req_headers = self._prepare_request(url, headers=headers)
         last_exc: Exception | None = None
         for opener in self._build_openers():
             try:
-                req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+                req = urllib.request.Request(final_url, data=data, method=method, headers=req_headers)
                 with opener.open(req, timeout=timeout) as resp:
                     body = resp.read() if method != "HEAD" else b""
                     hdrs = {k.lower(): v for k, v in resp.headers.items()}
                     return resp.status, hdrs, body, opener
             except urllib.error.HTTPError as he:
-                # HTTP 层返回（如 404/500/524）说明网络已连通，直接抛出
+                # HTTP 层返回（如 401/404/500/503/524）说明网络已连通，直接抛出
                 raise he
             except Exception as exc:
                 last_exc = exc
@@ -310,7 +398,9 @@ class CloudAutoSyncManager:
         vid = int(video.get("id") or 0)
         name = _safe_filename(str(video.get("name") or f"视频{vid}"), fallback=f"视频{vid}")
         model = _safe_filename(str(video.get("model_name") or ""), fallback="")
-        day = time.strftime("%Y%m%d")
+        code8 = re.sub(r"[^a-zA-Z0-9]+", "", str(video.get("code") or ""))[:8]
+        created_ms = int(video.get("created_at") or 0)
+        day = time.strftime("%Y%m%d", time.localtime(created_ms / 1000.0)) if created_ms > 1_000_000_000_000 else time.strftime("%Y%m%d")
         tag = "4K原画压小" if quality != "original" else "原片"
         parts = [f"云端成品_{vid}"]
         if name and name not in ("1", "2", "3", str(vid)):
@@ -318,19 +408,48 @@ class CloudAutoSyncManager:
         elif model:
             parts.append(model)
         parts.append(day)
+        if code8:
+            parts.append(code8)
         parts.append(tag)
         return "_".join(parts) + ".mp4"
 
     def _existing_local_match(self, save_dir: Path, video: dict[str, Any], quality: str) -> Path | None:
-        """兼容检查：如果该视频之前已按标准命名拉回本地（例如昨天已拉回的 1/2/3），避免重复下载。"""
-        vid = int(video.get("id") or 0)
+        """严格按唯一任务 code8 匹配本地已有成片，避免把不同天/不同任务的同序号视频误判为已下载。"""
         if not save_dir.is_dir():
             return None
+        code8 = re.sub(r"[^a-zA-Z0-9]+", "", str(video.get("code") or ""))[:8]
         tag = "4K原画压小" if quality != "original" else "原片"
-        for p in save_dir.glob(f"云端成品_{vid}_*{tag}.mp4"):
-            if p.is_file() and p.stat().st_size > 1024 * 1024:
-                return p
+        if code8:
+            for p in save_dir.glob(f"*{code8}*{tag}.mp4"):
+                if p.is_file() and p.stat().st_size > 1024 * 1024:
+                    return p
         return None
+
+    def pull_video_now(self, video_id: int, force: bool = True) -> dict[str, Any]:
+        """手动立即拉取指定编号的云端视频（force=True 时即便之前登记过也会重新拉回）。"""
+        with self._lock:
+            cloud_url = (self._config.get("cloud_url") or "").strip().rstrip("/")
+            save_dir = Path(self._config.get("save_dir") or str(DEFAULT_SAVE_DIR))
+            quality = str(self._config.get("quality") or "compact")
+            threads = max(1, min(12, int(self._config.get("threads") or 8)))
+            notify = bool(self._config.get("notify_desktop", True))
+        if not cloud_url:
+            raise RuntimeError("请先填写并保存云端创作台网址")
+        status, _, body, _ = self._http_request(f"{cloud_url}/api/videos", timeout=15)
+        if status != 200:
+            raise RuntimeError(f"云端返回 HTTP {status}")
+        payload = json.loads(body.decode("utf-8"))
+        videos = payload.get("videos", []) if isinstance(payload, dict) else payload
+        target = next((v for v in videos if isinstance(v, dict) and int(v.get("id") or 0) == int(video_id)), None)
+        if not target or target.get("status") != "success" or not target.get("file_ready"):
+            raise RuntimeError(f"云端未找到已完成的 #{video_id} 号视频")
+        key = self._video_sync_key(target)
+        if force:
+            with self._lock:
+                self._config["synced"].pop(key, None)
+            self._save_config()
+        self._download_one_video(cloud_url, target, save_dir, quality, threads, notify, key)
+        return {"ok": True, "video_id": video_id, "sync_key": key}
 
     def sync_once(self) -> dict[str, Any]:
         with self._lock:
@@ -352,6 +471,18 @@ class CloudAutoSyncManager:
                 raise RuntimeError(f"云端返回 HTTP {status}")
             payload = json.loads(body.decode("utf-8"))
             videos = payload.get("videos", []) if isinstance(payload, dict) else payload
+        except urllib.error.HTTPError as he:
+            if he.code == 503 and _is_fixed_gateway_url(cloud_url):
+                err_msg = "云端数字人当前未开机（休眠中），开机后会自动连上同步"
+            elif he.code == 401 and _is_fixed_gateway_url(cloud_url):
+                err_msg = "固定域名密码校验失败（HTTP 401），请检查本机 ~/.ssh/colab_hub_auth.json"
+            else:
+                err_msg = f"暂时连不上云端：{he}"
+            with self._lock:
+                self._runtime["connected"] = False
+                self._runtime["last_check_at"] = time.time()
+                self._runtime["last_error"] = err_msg
+            return {"ok": False, "reason": err_msg}
         except Exception as exc:
             with self._lock:
                 self._runtime["connected"] = False
@@ -367,8 +498,23 @@ class CloudAutoSyncManager:
         done_videos.sort(key=lambda x: int(x.get("id") or 0))
 
         with self._lock:
+            synced_map = self._config.get("synced") or {}
             self._runtime["connected"] = True
             self._runtime["cloud_video_count"] = len(done_videos)
+            self._runtime["cloud_videos"] = [
+                {
+                    "id": int(v.get("id") or 0),
+                    "name": str(v.get("name") or f"视频 #{v.get('id')}"),
+                    "model_name": str(v.get("model_name") or ""),
+                    "duration": round(float(v.get("duration") or 0.0), 1),
+                    "file_size_mb": v.get("file_size_mb"),
+                    "drive_compact_size_mb": v.get("drive_compact_size_mb"),
+                    "created_at": v.get("created_at"),
+                    "sync_key": self._video_sync_key(v),
+                    "synced": self._video_sync_key(v) in synced_map,
+                }
+                for v in reversed(done_videos)
+            ]
             self._runtime["last_check_at"] = time.time()
             self._runtime["last_error"] = ""
 
@@ -462,7 +608,7 @@ class CloudAutoSyncManager:
         else:
             dl_rel = f"/api/media/video/{vid}?download=1&quality=original"
 
-        dl_url = f"{cloud_url}{dl_rel}"
+        dl_url = _join_cloud_url(cloud_url, dl_rel)
         st_head, hdrs, _, fast_opener = self._http_request(dl_url, method="HEAD", timeout=30)
         if st_head != 200:
             raise RuntimeError(f"HEAD 探测返回 {st_head}")
@@ -479,7 +625,7 @@ class CloudAutoSyncManager:
         t0 = time.time()
         done_bytes = [0]
         write_lock = threading.Lock()
-        tok = (self._config.get("cloud_token") or "").strip()
+        auth_dl_url, base_auth_hdr = self._prepare_request(dl_url)
 
         with open(part, "wb") as f:
             f.truncate(total)
@@ -511,10 +657,9 @@ class CloudAutoSyncManager:
                     if self._stop_event.is_set():
                         raise RuntimeError("同步服务停止")
                     try:
-                        hdr = {"Range": f"bytes={s}-{e}"}
-                        if tok:
-                            hdr["Authorization"] = f"Bearer {tok}"
-                        req = urllib.request.Request(dl_url, headers=hdr)
+                        hdr = dict(base_auth_hdr)
+                        hdr["Range"] = f"bytes={s}-{e}"
+                        req = urllib.request.Request(auth_dl_url, headers=hdr)
                         with fast_opener.open(req, timeout=45) as resp:
                             buf = resp.read()
                             if len(buf) != expect:
@@ -536,8 +681,7 @@ class CloudAutoSyncManager:
                 for fut in concurrent.futures.as_completed(futs):
                     fut.result()
         else:
-            hdr = {"Authorization": f"Bearer {tok}"} if tok else {}
-            req = urllib.request.Request(dl_url, headers=hdr)
+            req = urllib.request.Request(auth_dl_url, headers=dict(base_auth_hdr))
             with fast_opener.open(req, timeout=300) as resp, open(part, "wb") as wf:
                 while True:
                     block = resp.read(1024 * 1024)

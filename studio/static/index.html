@@ -848,6 +848,17 @@
         <div class="card mt-16">
           <div class="card-header">
             <div>
+              <h3 class="card-title">云端现有成片（可手动拉回任意一条）</h3>
+              <div class="section-sub" id="cloudRemoteCountSub">连接云端后自动列出所有已完成视频，漏拉或想重拉直接点「手动拉回」</div>
+            </div>
+            <button class="btn btn-sm" onclick="triggerCloudSyncNow()">刷新云端列表</button>
+          </div>
+          <div id="cloudRemoteList" class="empty-state">暂未获取到云端成品列表。</div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-header">
+            <div>
               <h3 class="card-title">已自动拉回本地的云端成片</h3>
               <div class="section-sub" id="cloudSyncCountSub">共 0 条记录</div>
             </div>
@@ -972,6 +983,6 @@
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
-<script src="/static/app.js?v=2.5"></script>
+<script src="/static/app.js?v=2.6"></script>
 </body>
 </html>

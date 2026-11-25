@@ -14,10 +14,11 @@
   "index_tts_max_mel_tokens": 1500,
   "index_tts_max_text_tokens_per_segment": 120,
   "index_tts_device": "auto",
-  "index_tts_default_prompt": "D:/HeyGem/tts-story-f5/data/voice_prompts/myvoice_natural_prompt.wav",
+  "index_tts_default_prompt": "",
   "index_tts_chunk_size": 180,
   "index_tts_interval_silence": 200,
   "index_tts_speed": 1.0,
+  "index_tts_postprocess_mode": "fixB",
   "index_tts_lang": "ZH",
   "index_tts_text_normalization": true,
   "index_tts_emo_mode": "same_as_speaker",
@@ -41,6 +42,8 @@
   "index_tts_fast_num_beams": 1,
   "index_tts_fast_diffusion_steps": 12,
   "index_tts_fast_max_text_tokens_per_segment": 120,
-  "index_tts_cfg_path": "D:/IndexTTS2-Training/merged_models/config_myvoice.yaml",
-  "index_tts_override_request_prompt": true
+  "index_tts_cfg_path": "",
+  "index_tts_override_request_prompt": false,
+  "voices_registry_path": "D:/IndexTTS2-Training/voices/registry.json",
+  "biz_db_path": "C:/Users/win10/AppData/Roaming/Duix.Avatar/biz.db"
 }

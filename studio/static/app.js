@@ -3609,6 +3609,38 @@ async function refreshCloudSyncStatus(fillInputs = false) {
       }
     }
 
+    const remoteSub = document.getElementById("cloudRemoteCountSub");
+    const remoteListEl = document.getElementById("cloudRemoteList");
+    const remoteVids = st.cloud_videos || [];
+    if (remoteSub) remoteSub.textContent = `云端共 ${remoteVids.length} 条已完成视频 · 任意一条都能点右侧按钮 8 线程高速拉回本地`;
+    if (remoteListEl) {
+      if (!remoteVids.length) {
+        remoteListEl.className = "empty-state";
+        remoteListEl.innerHTML = st.connected ? "云端目前暂无已完成视频。" : "暂未获取到云端成品列表。";
+      } else {
+        remoteListEl.className = "";
+        const busyNow = Boolean(st.active_download);
+        remoteListEl.innerHTML = remoteVids.map((cv) => {
+          const badge = cv.synced ? `<span class="tag ok">已拉回</span>` : `<span class="tag">未拉回</span>`;
+          const btnLabel = cv.synced ? "重新拉回" : "⬇ 手动拉回";
+          const sz = cv.drive_compact_size_mb
+            ? `压小版 ${cv.drive_compact_size_mb}M / 原片 ${cv.file_size_mb || "?"}M`
+            : `原片 ${cv.file_size_mb || "?"}M`;
+          const dtStr = cv.created_at ? new Date(cv.created_at).toLocaleString("zh-CN") : "";
+          return `
+            <div class="list-row" style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);">
+              <div style="min-width:0;flex:1;">
+                <div style="font-weight:600;word-break:break-all;">#${cv.id} · ${esc(cv.name)} ${badge}</div>
+                <div class="section-sub" style="margin-top:2px;">底版：${esc(cv.model_name || "-")} · 时长 ${cv.duration || 0}s · ${sz}${dtStr ? ` · ${dtStr}` : ""}</div>
+              </div>
+              <div class="flex-row" style="flex-shrink:0;gap:6px;">
+                <button class="btn btn-sm ${cv.synced ? "" : "btn-primary"}" ${busyNow ? "disabled" : ""} onclick="pullCloudVideoNow(${cv.id})">${btnLabel}</button>
+              </div>
+            </div>`;
+        }).join("");
+      }
+    }
+
     const cntSub = document.getElementById("cloudSyncCountSub");
     const listEl = document.getElementById("cloudSyncList");
     const items = st.synced_items || [];
@@ -3679,6 +3711,17 @@ async function triggerCloudSyncNow() {
     setTimeout(() => refreshCloudSyncStatus(false), 1200);
   } catch (err) {
     toast(err.message, "error");
+  }
+}
+
+async function pullCloudVideoNow(videoId) {
+  try {
+    const res = await api(`/api/v1/cloud-sync/pull/${videoId}`, { method: "POST" });
+    toast(res.message || `已开始拉回 #${videoId} 号视频`, "success", 2600);
+    state.cloudSyncActive = true;
+    setTimeout(() => refreshCloudSyncStatus(false), 1000);
+  } catch (err) {
+    toast(`拉取失败：${err.message}`, "error");
   }
 }
 

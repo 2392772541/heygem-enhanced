@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,8 +15,10 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import numpy as np
 import soundfile as sf
@@ -25,6 +28,10 @@ APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
 CONFIG_PATH = APP_ROOT / "config.json"
 STUDIO_WORKER_SCRIPT = APP_ROOT / "indextts2_studio_worker.py"
+DEFAULT_TRAINING_ROOT = Path(r"D:\IndexTTS2-Training")
+DEFAULT_REGISTRY_PATH = DEFAULT_TRAINING_ROOT / "voices" / "registry.json"
+DEFAULT_BIZ_DB_PATH = Path(r"C:\Users\win10\AppData\Roaming\Duix.Avatar\biz.db")
+ALLOWED_GLOBAL_MODES = {"auto", "force_voice", "force_official"}
 
 INDEX_TTS_SAMPLE_RATE = 22050
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -51,9 +58,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "index_tts_default_prompt": "",
     "index_tts_override_request_prompt": False,
     "index_tts_cfg_path": "",
+    "voices_registry_path": str(DEFAULT_REGISTRY_PATH).replace("\\", "/"),
+    "biz_db_path": str(DEFAULT_BIZ_DB_PATH).replace("\\", "/"),
     "index_tts_chunk_size": 180,
     "index_tts_interval_silence": 200,
     "index_tts_speed": 1.0,
+    "index_tts_postprocess_mode": "fixB",
     "index_tts_lang": "ZH",
     "index_tts_text_normalization": True,
     "index_tts_emo_mode": "same_as_speaker",
@@ -269,6 +279,136 @@ def _save_config(patch: dict[str, Any]) -> dict[str, Any]:
     return current
 
 
+@dataclass(frozen=True)
+class BoundVoiceAssets:
+    voice_id: str
+    model_key: str
+    prompt_key: str
+    cfg_path: str
+    prompt_path: Path
+
+
+@dataclass(frozen=True)
+class RouteResolution:
+    routing_mode: str
+    binding_matched: bool
+    voice_id: str
+    voice_mode: str
+    model_version: str
+    cfg_path: str
+    prompt_path: Path
+    prompt_overridden: bool
+    avatar_stem: str
+    requested_raw: str
+    model_key: str = ""
+    prompt_key: str = ""
+
+
+def _norm_abs_case_str(path_val: Path | str) -> str:
+    raw = str(path_val).strip()
+    if raw.startswith("\\\\?\\") or raw.startswith("\\\\.\\"):
+        raw = raw[4:]
+    try:
+        resolved = str(Path(raw).resolve())
+    except OSError:
+        resolved = os.path.abspath(raw)
+    if resolved.startswith("\\\\?\\") or resolved.startswith("\\\\.\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+def _is_official_base_path(path_val: Path | str) -> bool:
+    roots: list[Path] = []
+    if ENGINE_ROOT is not None:
+        roots.append(ENGINE_ROOT)
+    roots.append(Path(r"D:\HeyGem\tts-story-f5\engines\index-tts"))
+    official_targets: list[Path] = []
+    for root in roots:
+        official_targets.extend(
+            [
+                root / "checkpoints" / "config.yaml",
+                root / "checkpoints" / "gpt.pth",
+                root / "checkpoints_2_5" / "config.yaml",
+                root / "checkpoints_2_5" / "gpt.pth",
+            ]
+        )
+    cand_norm = _norm_abs_case_str(path_val)
+    cand_path = Path(str(path_val))
+    for target in official_targets:
+        if cand_norm == _norm_abs_case_str(target):
+            return True
+        try:
+            if cand_path.exists() and target.exists() and os.path.samefile(cand_path, target):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _resolve_registry_path(config: dict[str, Any] | None = None) -> Path:
+    for env_key in ("INDEX_TTS_VOICES_REGISTRY", "MYVOICE_REGISTRY_PATH"):
+        raw = os.getenv(env_key)
+        if raw is not None and raw.strip():
+            return Path(raw.strip().strip('"').strip("'"))
+    if config:
+        for cfg_key in ("voices_registry_path", "index_tts_voices_registry_path"):
+            cfg_val = config.get(cfg_key)
+            if isinstance(cfg_val, str) and cfg_val.strip():
+                return Path(cfg_val.strip().strip('"').strip("'"))
+    root_raw = os.getenv("MYVOICE_TRAINING_ROOT", "").strip().strip('"').strip("'")
+    root = Path(root_raw) if root_raw else DEFAULT_TRAINING_ROOT
+    return root / "voices" / "registry.json"
+
+
+def _load_registry(config: dict[str, Any] | None = None) -> tuple[Path, dict[str, Any]]:
+    reg_path = _resolve_registry_path(config)
+    if not reg_path.is_file():
+        raise FileNotFoundError(
+            f"声音总档案 registry.json 不存在（禁止静默回退官方原版）: {reg_path}"
+        )
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise ValueError(f"声音总档案 registry.json 解析失败（禁止静默回退官方原版）: {reg_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"registry.json 顶层必须为 JSON 对象: {reg_path}")
+    if data.get("schema_version") != 1:
+        raise ValueError(f"registry.json schema_version 不受支持: {data.get('schema_version')!r}")
+
+    voices = data.get("voices")
+    if not isinstance(voices, list):
+        raise ValueError("registry.json 缺少有效的 voices 列表")
+    for idx, voice in enumerate(voices):
+        if not isinstance(voice, dict) or not str(voice.get("voice_id") or "").strip():
+            raise ValueError(f"registry.json voices[{idx}] 缺少有效的 voice_id")
+
+    routing = data.get("heygem_routing")
+    if not isinstance(routing, dict):
+        raise ValueError("registry.json 缺少有效的 heygem_routing 对象")
+    global_mode = str(routing.get("global_mode") or "auto").strip()
+    if global_mode not in ALLOWED_GLOBAL_MODES:
+        raise ValueError(f"registry.json heygem_routing.global_mode 非法: {global_mode!r}")
+    bindings = routing.get("bindings")
+    if bindings is not None and not isinstance(bindings, dict):
+        raise ValueError("registry.json heygem_routing.bindings 必须为对象")
+
+    return reg_path, data
+
+
+def _validate_official_base(model_version: str = "IndexTTS-2") -> Path:
+    if ENGINE_ROOT is None:
+        raise FileNotFoundError("未找到 IndexTTS 引擎目录")
+    checkpoint_dir = ENGINE_ROOT / ("checkpoints_2_5" if model_version == "IndexTTS-2.5" else "checkpoints")
+    cfg_path = (checkpoint_dir / "config.yaml").resolve()
+    gpt_path = (checkpoint_dir / "gpt.pth").resolve()
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"官方底座配置文件不存在: {cfg_path}")
+    if not gpt_path.is_file():
+        raise FileNotFoundError(f"官方底座权重文件不存在: {gpt_path}")
+    return cfg_path
+
+
 def _normalize_path_string(value: Any) -> str:
     if value is None:
         return ""
@@ -457,6 +597,167 @@ def _resolve_invoke_prompt(
     return _resolve_audio_path(effective_raw), False, requested_raw
 
 
+def _extract_candidate_stems(raw_path: Any) -> list[str]:
+    """从 reference_audio / origin_audio 路径中提取按优先级排列的候选数字人标识。"""
+    if raw_path is None:
+        return []
+    normalized = _normalize_path_string(raw_path)
+    if not normalized:
+        return []
+
+    pieces = [piece.strip() for piece in normalized.split("|||") if piece.strip()]
+    if not pieces:
+        pieces = [normalized]
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _push(val: str) -> None:
+        val = val.strip()
+        if val and val not in seen:
+            seen.add(val)
+            candidates.append(val)
+
+    for piece in pieces:
+        cleaned_piece = piece
+        for prefix in ("/code/data/", "d:/duix_avatar_data/voice/data/", "c:/duix_avatar_data/voice/data/"):
+            if cleaned_piece.lower().startswith(prefix):
+                cleaned_piece = cleaned_piece[len(prefix):]
+                break
+        if cleaned_piece.lower().startswith("origin_audio/"):
+            cleaned_piece = cleaned_piece[len("origin_audio/"):]
+        basename = Path(cleaned_piece).name
+        if not basename:
+            continue
+        raw_stem = Path(basename).stem
+        no_part = re.sub(r"_part\d+$", "", raw_stem, flags=re.IGNORECASE)
+        stripped = re.sub(r"^(?:format_denoise_|format_)+", "", no_part, flags=re.IGNORECASE)
+        m17 = re.search(r"(\d{17})", stripped) or re.search(r"(\d{17})", raw_stem)
+        if m17:
+            _push(m17.group(1))
+        _push(stripped)
+        _push(no_part)
+        _push(raw_stem)
+    return candidates
+
+
+def _extract_avatar_stem(raw_path: Any) -> str:
+    stems = _extract_candidate_stems(raw_path)
+    return stems[0] if stems else ""
+
+
+def _resolve_biz_db_path(config: dict[str, Any] | None = None) -> Path:
+    env_db = os.getenv("HEYGEM_BIZ_DB_PATH")
+    if env_db is not None and env_db.strip():
+        return Path(env_db.strip().strip('"').strip("'"))
+    if config:
+        for key in ("biz_db_path", "index_tts_biz_db_path"):
+            val = config.get(key)
+            if isinstance(val, str) and val.strip():
+                return Path(val.strip().strip('"').strip("'"))
+    return DEFAULT_BIZ_DB_PATH
+
+
+def _lookup_stems_in_biz_db(
+    candidates: list[str],
+    config: dict[str, Any] | None = None,
+) -> list[str]:
+    """可选只读查询 biz.db，在 asr_format_audio_url 与 f2f_model.audio_path 不同源时补充映射。"""
+    if not candidates:
+        return []
+    db_path = _resolve_biz_db_path(config)
+    if not db_path.is_file():
+        return []
+
+    cand_set = set(candidates)
+    extra_stems: list[str] = []
+    seen: set[str] = set()
+    try:
+        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=0.5)
+        try:
+            cur = conn.cursor()
+            rows: list[tuple[Any, ...]] = []
+            try:
+                rows.extend(
+                    cur.execute(
+                        "SELECT f.audio_path, v.origin_audio_path, v.asr_format_audio_url "
+                        "FROM f2f_model f LEFT JOIN voice v ON f.voice_id = v.id"
+                    ).fetchall()
+                )
+            except sqlite3.Error:
+                pass
+            try:
+                rows.extend(
+                    cur.execute(
+                        "SELECT '' AS audio_path, origin_audio_path, asr_format_audio_url FROM voice"
+                    ).fetchall()
+                )
+            except sqlite3.Error:
+                pass
+            for row in rows:
+                row_stems: list[str] = []
+                for col in row:
+                    if isinstance(col, str) and col.strip():
+                        row_stems.extend(_extract_candidate_stems(col))
+                if cand_set.intersection(row_stems):
+                    for st in row_stems:
+                        if st not in cand_set and st not in seen:
+                            seen.add(st)
+                            extra_stems.append(st)
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return extra_stems
+
+
+def _match_binding_by_stems(bindings: dict[str, Any], stems: list[str]) -> dict[str, Any] | None:
+    if not stems or not bindings:
+        return None
+    for stem in stems:
+        entry = bindings.get(stem)
+        if isinstance(entry, dict):
+            return entry
+    stem_set = set(stems)
+    for key, entry in bindings.items():
+        if not isinstance(entry, dict):
+            continue
+        entry_stems = set(_extract_candidate_stems(key))
+        entry_stems.update(_extract_candidate_stems(entry.get("avatar_stem")))
+        entry_stems.update(_extract_candidate_stems(entry.get("origin_audio_rel")))
+        if stem_set.intersection(entry_stems):
+            return entry
+    return None
+
+
+def _lookup_binding_for_request(
+    routing: dict[str, Any],
+    raw_reference_audio: Any,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    bindings = routing.get("bindings") or {}
+    if not isinstance(bindings, dict):
+        return None, ""
+    candidates = _extract_candidate_stems(raw_reference_audio)
+    avatar_stem = candidates[0] if candidates else ""
+    if not candidates:
+        return None, ""
+
+    matched = _match_binding_by_stems(bindings, candidates)
+    if matched is None:
+        db_stems = _lookup_stems_in_biz_db(candidates, config)
+        if db_stems:
+            matched = _match_binding_by_stems(bindings, db_stems)
+
+    if matched is None:
+        return None, avatar_stem
+    vid = str(matched.get("voice_id") or "").strip()
+    if not vid or vid.lower() == "official_base":
+        return None, avatar_stem
+    return matched, avatar_stem
+
+
 def _timestamp_from_name(name: str) -> str:
     match = re.search(r"(\d{17})", name)
     if match:
@@ -606,7 +907,11 @@ def _extract_yaml_scalar(yaml_path: Path, key: str) -> str:
     return ""
 
 
-def _resolve_and_validate_cfg_path(model_version: str, raw_custom_cfg: str) -> tuple[str, str]:
+def _resolve_and_validate_cfg_path(
+    model_version: str,
+    raw_custom_cfg: str,
+    disallow_official: bool = False,
+) -> tuple[str, str]:
     """根据模型版本解析并严格校验 cfg_path 与内部 gpt_checkpoint，严禁静默回退官方原版。"""
     if ENGINE_ROOT is None:
         return "", "base"
@@ -614,13 +919,21 @@ def _resolve_and_validate_cfg_path(model_version: str, raw_custom_cfg: str) -> t
     default_cfg = (checkpoint_dir / "config.yaml").resolve()
     custom_cfg = (raw_custom_cfg or "").strip()
 
-    if custom_cfg and model_version == "IndexTTS-2":
+    if custom_cfg:
+        if model_version != "IndexTTS-2":
+            raise ValueError(
+                f"自定义微调模型仅支持 IndexTTS-2，不支持 {model_version}（禁止静默回退官方原版）"
+            )
         custom_path = Path(custom_cfg)
         if not custom_path.is_file():
             raise FileNotFoundError(
                 f"显式指定的 IndexTTS2 配置文件不存在或不是有效文件（禁止静默回退官方原版）: {custom_path}"
             )
         resolved_cfg = custom_path.resolve()
+        if disallow_official and _is_official_base_path(resolved_cfg):
+            raise ValueError(
+                f"绑定声音的配置文件禁止指向官方原版只读配置（禁止伪装回退）: {resolved_cfg}"
+            )
         gpt_ckpt = _extract_yaml_scalar(resolved_cfg, "gpt_checkpoint")
         if not gpt_ckpt:
             raise ValueError(
@@ -628,15 +941,247 @@ def _resolve_and_validate_cfg_path(model_version: str, raw_custom_cfg: str) -> t
             )
         gpt_path = Path(gpt_ckpt)
         if not gpt_path.is_absolute():
+            if resolved_cfg != default_cfg:
+                raise ValueError(
+                    f"自定义配置文件内的 gpt_checkpoint 必须为绝对路径（禁止相对路径解析到官方 checkpoints/）: {gpt_ckpt!r} (来自 {resolved_cfg})"
+                )
             gpt_path = (checkpoint_dir / gpt_path).resolve()
         if not gpt_path.is_file():
             raise FileNotFoundError(
                 f"显式指定的 IndexTTS2 配置指向的 GPT 权重不存在（禁止静默回退官方原版）: {gpt_path} (来自 {resolved_cfg})"
             )
+        if disallow_official and _is_official_base_path(gpt_path):
+            raise ValueError(
+                f"绑定声音的 GPT 权重禁止指向官方原版只读权重（禁止伪装回退）: {gpt_path} (来自 {resolved_cfg})"
+            )
         voice_mode = "personal" if resolved_cfg != default_cfg else "base"
         return str(resolved_cfg), voice_mode
 
     return str(default_cfg), "base"
+
+
+def _resolve_bound_voice_assets(
+    registry: dict[str, Any],
+    *,
+    voice_id: str,
+    model_key: str | None = None,
+    prompt_key: str | None = None,
+    context_label: str = "声音绑定",
+) -> BoundVoiceAssets:
+    target_vid = (voice_id or "").strip()
+    if not target_vid or target_vid.lower() == "official_base":
+        raise ValueError(f"{context_label}: 目标 voice_id 无效: {voice_id!r}（禁止静默回退官方原版）")
+
+    voice_obj: dict[str, Any] | None = None
+    for item in registry.get("voices") or []:
+        if isinstance(item, dict) and str(item.get("voice_id") or "").strip() == target_vid:
+            voice_obj = item
+            break
+    if voice_obj is None:
+        raise FileNotFoundError(
+            f"{context_label}: 声音档案 '{target_vid}' 不存在（禁止静默回退官方原版）"
+        )
+
+    eff_model_key = str(model_key or "").strip() or str(voice_obj.get("default_model_key") or "").strip()
+    models = voice_obj.get("models")
+    if not isinstance(models, dict) or not eff_model_key or not isinstance(models.get(eff_model_key), dict):
+        raise FileNotFoundError(
+            f"{context_label}: 模型版本 '{eff_model_key}' 在档案 '{target_vid}' 中不存在（禁止静默回退）"
+        )
+    model_entry = models[eff_model_key]
+
+    cfg_raw = _normalize_path_string(model_entry.get("cfg_path"))
+    if not cfg_raw:
+        raise FileNotFoundError(
+            f"{context_label}: 档案 '{target_vid}' 模型 '{eff_model_key}' 缺少 cfg_path（禁止静默回退）"
+        )
+    resolved_cfg, _ = _resolve_and_validate_cfg_path("IndexTTS-2", cfg_raw, disallow_official=True)
+
+    raw_gpt_val = model_entry.get("gpt_path")
+    if raw_gpt_val is not None and not isinstance(raw_gpt_val, str):
+        raise ValueError(
+            f"{context_label}: 档案 '{target_vid}' 模型 '{eff_model_key}' 的 gpt_path 必须为字符串（禁止静默回退）"
+        )
+    gpt_raw = _normalize_path_string(raw_gpt_val).strip()
+    if not gpt_raw:
+        raise FileNotFoundError(
+            f"{context_label}: 档案 '{target_vid}' 模型 '{eff_model_key}' 缺少 gpt_path（禁止静默回退）"
+        )
+    gpt_path = Path(gpt_raw)
+    if not gpt_path.is_file():
+        raise FileNotFoundError(
+            f"{context_label}: 档案 '{target_vid}' 模型 '{eff_model_key}' 的 gpt_path 不存在: {gpt_path}（禁止静默回退）"
+        )
+    if _is_official_base_path(gpt_path):
+        raise ValueError(
+            f"{context_label}: 档案 '{target_vid}' 的 gpt_path 禁止指向官方原版权重: {gpt_path}"
+        )
+
+    eff_prompt_key = str(prompt_key or "").strip() or str(voice_obj.get("default_prompt_key") or "").strip()
+    prompts = voice_obj.get("prompts")
+    if not isinstance(prompts, dict) or not eff_prompt_key or not isinstance(prompts.get(eff_prompt_key), dict):
+        raise FileNotFoundError(
+            f"{context_label}: 参考音 '{eff_prompt_key}' 在档案 '{target_vid}' 中不存在（禁止静默回退）"
+        )
+    prompt_raw = _normalize_path_string(prompts[eff_prompt_key].get("path"))
+    if not prompt_raw:
+        raise FileNotFoundError(
+            f"{context_label}: 档案 '{target_vid}' 参考音 '{eff_prompt_key}' 路径为空（禁止静默回退）"
+        )
+    prompt_candidate = Path(prompt_raw)
+    if not prompt_candidate.is_file():
+        raise FileNotFoundError(
+            f"{context_label}: 绑定参考音文件不存在: {prompt_candidate}（禁止静默回退）"
+        )
+
+    return BoundVoiceAssets(
+        voice_id=target_vid,
+        model_key=eff_model_key,
+        prompt_key=eff_prompt_key,
+        cfg_path=resolved_cfg,
+        prompt_path=prompt_candidate.resolve(),
+    )
+
+
+def _resolve_invoke_routing(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    payload: dict[str, Any],
+    params: dict[str, Any],
+) -> RouteResolution:
+    routing = registry.get("heygem_routing") or {}
+    global_mode = str(routing.get("global_mode") or "auto").strip()
+    if global_mode not in ALLOWED_GLOBAL_MODES:
+        raise ValueError(f"非法的 heygem_routing.global_mode: {global_mode!r}")
+
+    requested_raw = _normalize_path_string(payload.get("reference_audio"))
+    respect_request = _extract_respect_request_prompt(payload)
+    requested_mv = str(params.get("model_version") or "IndexTTS-2")
+
+    if global_mode == "force_official":
+        official_cfg = _validate_official_base(requested_mv)
+        prompt_path = _resolve_audio_path(requested_raw)
+        avatar_stem = _extract_avatar_stem(requested_raw)
+        return RouteResolution(
+            routing_mode="force_official",
+            binding_matched=False,
+            voice_id="official_base",
+            voice_mode="base",
+            model_version=requested_mv,
+            cfg_path=str(official_cfg),
+            prompt_path=prompt_path,
+            prompt_overridden=False,
+            avatar_stem=avatar_stem,
+            requested_raw=requested_raw,
+        )
+
+    if global_mode == "force_voice":
+        forced_vid = str(routing.get("forced_voice_id") or "").strip()
+        assets = _resolve_bound_voice_assets(
+            registry,
+            voice_id=forced_vid,
+            model_key=str(routing.get("forced_model_key") or ""),
+            prompt_key=str(routing.get("forced_prompt_key") or ""),
+            context_label="全局强制声音模式(force_voice)",
+        )
+        avatar_stem = _extract_avatar_stem(requested_raw)
+        prompt_path = assets.prompt_path
+        if requested_raw:
+            try:
+                prompt_overridden = _resolve_audio_path(requested_raw).resolve() != prompt_path.resolve()
+            except Exception:
+                prompt_overridden = True
+        else:
+            prompt_overridden = False
+        return RouteResolution(
+            routing_mode="force_voice",
+            binding_matched=False,
+            voice_id=assets.voice_id,
+            voice_mode="personal",
+            model_version="IndexTTS-2",
+            cfg_path=assets.cfg_path,
+            prompt_path=prompt_path,
+            prompt_overridden=prompt_overridden,
+            avatar_stem=avatar_stem,
+            requested_raw=requested_raw,
+            model_key=assets.model_key,
+            prompt_key=assets.prompt_key,
+        )
+
+    binding, avatar_stem = _lookup_binding_for_request(routing, requested_raw, config)
+    if binding is not None:
+        assets = _resolve_bound_voice_assets(
+            registry,
+            voice_id=str(binding.get("voice_id") or ""),
+            model_key=str(binding.get("model_key") or ""),
+            prompt_key=str(binding.get("prompt_key") or ""),
+            context_label=f"数字人绑定({avatar_stem or requested_raw})",
+        )
+        prompt_path = assets.prompt_path
+        if requested_raw:
+            try:
+                prompt_overridden = _resolve_audio_path(requested_raw).resolve() != prompt_path.resolve()
+            except Exception:
+                prompt_overridden = True
+        else:
+            prompt_overridden = False
+        return RouteResolution(
+            routing_mode="auto",
+            binding_matched=True,
+            voice_id=assets.voice_id,
+            voice_mode="personal",
+            model_version="IndexTTS-2",
+            cfg_path=assets.cfg_path,
+            prompt_path=prompt_path,
+            prompt_overridden=prompt_overridden,
+            avatar_stem=avatar_stem,
+            requested_raw=requested_raw,
+            model_key=assets.model_key,
+            prompt_key=assets.prompt_key,
+        )
+
+    official_cfg = _validate_official_base(requested_mv)
+    prompt_path = _resolve_audio_path(requested_raw)
+    return RouteResolution(
+        routing_mode="auto",
+        binding_matched=False,
+        voice_id="official_base",
+        voice_mode="base",
+        model_version=requested_mv,
+        cfg_path=str(official_cfg),
+        prompt_path=prompt_path,
+        prompt_overridden=False,
+        avatar_stem=avatar_stem,
+        requested_raw=requested_raw,
+    )
+
+
+def _audit_bindings(registry: dict[str, Any]) -> tuple[int, bool, dict[str, str]]:
+    routing = registry.get("heygem_routing") or {}
+    bindings = routing.get("bindings") or {}
+    if not isinstance(bindings, dict):
+        return 0, False, {"_schema": "heygem_routing.bindings 必须为对象"}
+    errors: dict[str, str] = {}
+    active_count = 0
+    for key, entry in bindings.items():
+        if not isinstance(entry, dict):
+            errors[str(key)] = "绑定项必须为对象"
+            continue
+        vid = str(entry.get("voice_id") or "").strip()
+        if not vid or vid.lower() == "official_base":
+            continue
+        active_count += 1
+        try:
+            _resolve_bound_voice_assets(
+                registry,
+                voice_id=vid,
+                model_key=str(entry.get("model_key") or ""),
+                prompt_key=str(entry.get("prompt_key") or ""),
+                context_label=f"绑定校验({key})",
+            )
+        except Exception as exc:
+            errors[str(key)] = str(exc)
+    return active_count, (len(errors) == 0), errors
 
 
 def _normalize_model_version_for_config(raw_version: Any) -> str:
@@ -735,8 +1280,7 @@ def _resolve_effective_params(config: dict[str, Any], payload: dict[str, Any], t
             raise FileNotFoundError("当前情感模式为「情感参考音频」，请先上传情感参考音或填写有效本地音频路径。")
         emo_audio_resolved = str(_resolve_audio_path(emo_audio_raw))
 
-    # cfg_path 优先级：请求显式非空传参 > 环境变量 INDEX_TTS_CFG_PATH > config.json
-    # 注意：表单/客户端序列化的空字符串 "" 不得静默把个人模式降级回官方原版！
+    # 阶段 1 参数准备：实际多声音路由在 /v1/invoke 中由 _resolve_invoke_routing 接管，此处不预校验 payload.cfg_path
     raw_cfg_path = ""
     if "cfg_path" in tts_params and tts_params["cfg_path"] is not None:
         if not isinstance(tts_params["cfg_path"], str):
@@ -747,18 +1291,7 @@ def _resolve_effective_params(config: dict[str, Any], payload: dict[str, Any], t
             raise ValueError("cfg_path 必须为字符串。")
         raw_cfg_path = payload["cfg_path"].strip().strip('"').strip("'")
 
-    if not raw_cfg_path:
-        env_cfg = os.getenv("INDEX_TTS_CFG_PATH")
-        if env_cfg is not None and env_cfg.strip():
-            raw_cfg_path = env_cfg.strip().strip('"').strip("'")
-        else:
-            cfg_val = config.get("index_tts_cfg_path")
-            if cfg_val is not None and not isinstance(cfg_val, str):
-                raise ValueError("index_tts_cfg_path 必须为字符串。")
-            raw_cfg_path = (cfg_val or "").strip().strip('"').strip("'")
-
-    # 阶段 1 即完成自定义个人模型 YAML 与内部 GPT 权重校验，失败直接返回 400 且不污染 _STATUS
-    active_cfg_path, voice_mode = _resolve_and_validate_cfg_path(model_version, raw_cfg_path)
+    active_cfg_path, voice_mode = _resolve_and_validate_cfg_path(model_version, "")
 
     return {
         "profile_name": profile_name,
@@ -784,6 +1317,7 @@ def _resolve_effective_params(config: dict[str, Any], payload: dict[str, Any], t
         "max_text_tokens_per_segment": max(20, min(300, max_text_tokens)),
         "interval_silence": max(0, min(2000, int(pick("interval_silence", "index_tts_interval_silence", 200)))),
         "speed": speed,
+        "postprocess_mode": str(pick("postprocess_mode", "index_tts_postprocess_mode", "fixB") or "fixB").strip(),
         "duration_factor": duration_factor,
         "lang": str(pick("lang", "index_tts_lang", "ZH") or "ZH").upper(),
         "text_normalization": bool(pick("text_normalization", "index_tts_text_normalization", True)),
@@ -912,9 +1446,14 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
 
         # 纵深防御：即使直接调用 _run_studio_worker 也严格校验配置与内部权重，绝不静默回退官方原版
         raw_custom_cfg = str(params.get("cfg_path") or "").strip()
-        if not raw_custom_cfg and "cfg_path" not in params:
-            raw_custom_cfg = (os.getenv("INDEX_TTS_CFG_PATH") or "").strip()
-        active_cfg_path, _voice_mode = _resolve_and_validate_cfg_path(model_version, raw_custom_cfg)
+        is_personal = str(params.get("voice_mode") or "base") == "personal"
+        if is_personal and not raw_custom_cfg:
+            raise ValueError("个人声音模式缺少 cfg_path（禁止静默回退官方原版）")
+        active_cfg_path, _voice_mode = _resolve_and_validate_cfg_path(
+            model_version,
+            raw_custom_cfg,
+            disallow_official=is_personal,
+        )
 
         job_payload = {
             "model_dir": str(checkpoint_dir),
@@ -952,6 +1491,7 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
         job_file.write_text(json.dumps(job_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         env = os.environ.copy()
+        env.pop("INDEX_TTS_CFG_PATH", None)
         env["PYTHONPATH"] = str(ENGINE_ROOT)
         env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -1111,6 +1651,26 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
         if model_version == "IndexTTS-2" and abs(params["speed"] - 1.0) > 0.02:
             merged = _apply_speed_atempo(merged, actual_sr, params["speed"])
 
+        # 去电音后处理（默认版本 B：AI 音质重绘 7:3 混音；支持 fixA / off，缺失依赖时优雅降级）
+        pp_mode = str(params.get("postprocess_mode") or "fixB").strip()
+        if pp_mode.lower() != "off" and os.getenv("HEYGEM_DISABLE_POSTPROCESS") != "1":
+            try:
+                _cloud_app_dir = Path(r"E:\工程项目\antigravity项目\最新自用\heygem-cloud-studio")
+                if _cloud_app_dir.is_dir() and str(_cloud_app_dir) not in sys.path:
+                    sys.path.insert(0, str(_cloud_app_dir))
+                from app.audio_postprocess import apply_audio_postprocess
+
+                _update_status(state="postprocessing", stage="de_metallic", progress=98, message=f"正在执行音质去电音({pp_mode})...")
+                merged, actual_sr, actual_pp = apply_audio_postprocess(
+                    merged,
+                    actual_sr,
+                    mode=pp_mode,
+                    ffmpeg_exe=_resolve_ffmpeg_exe(),
+                )
+                _update_status(append_log=f"音质后处理完成: {actual_pp} ({actual_sr} Hz)")
+            except Exception as _pp_exc:
+                logger.warning("音质去电音后处理跳过: %s", _pp_exc)
+
         _update_status(
             state="idle",
             stage="done",
@@ -1125,6 +1685,7 @@ def _run_studio_worker(prompt_path: Path, params: dict[str, Any], job_id: str) -
 def healthz() -> Response:
     available, reason, versions = _engine_availability()
     status = _snapshot_status()
+    env_cfg_ignored = bool((os.getenv("INDEX_TTS_CFG_PATH") or "").strip())
     try:
         cfg = _load_config()
     except Exception as exc:
@@ -1138,6 +1699,11 @@ def healthz() -> Response:
                 "available_versions": versions,
                 "model_version": "IndexTTS-2",
                 "voice_mode": "invalid",
+                "routing_mode": "invalid",
+                "forced_voice_id": "",
+                "forced_model_key": "",
+                "forced_prompt_key": "",
+                "active_voice_id": "",
                 "active_cfg_path": "",
                 "cfg_valid": False,
                 "cfg_error": str(exc),
@@ -1146,42 +1712,134 @@ def healthz() -> Response:
                 "prompt_override_active": False,
                 "prompt_valid": False,
                 "prompt_error": str(exc),
+                "registry_path": str(_resolve_registry_path(None)),
+                "registry_valid": False,
+                "registry_error": str(exc),
+                "voices_count": 0,
+                "bindings_count": 0,
+                "bindings_valid": False,
+                "invalid_bindings": {},
+                "official_cfg_path": "",
+                "official_cfg_valid": False,
+                "index_tts_cfg_path_env_ignored": env_cfg_ignored,
+                "hot_reload_supported": True,
                 "shared_root": str(SHARED_ROOT),
                 "engine_root": str(ENGINE_ROOT) if ENGINE_ROOT else None,
             }
         )
-    model_version = _normalize_model_version_for_config(cfg.get("index_tts_model_version", "IndexTTS-2"))
-    env_cfg = os.getenv("INDEX_TTS_CFG_PATH")
-    cfg_val = cfg.get("index_tts_cfg_path")
-    cfg_valid = True
-    cfg_error = ""
-    if env_cfg is not None and env_cfg.strip():
-        raw_custom_cfg = env_cfg.strip().strip('"').strip("'")
-    elif cfg_val is not None and not isinstance(cfg_val, str):
-        raw_custom_cfg = str(cfg_val)
-        active_cfg_path = raw_custom_cfg
-        voice_mode = "invalid"
-        cfg_valid = False
-        cfg_error = "index_tts_cfg_path 必须为字符串。"
-    else:
-        raw_custom_cfg = (cfg_val or "").strip().strip('"').strip("'")
 
-    if cfg_valid:
+    reg_path_obj = _resolve_registry_path(cfg)
+    try:
+        reg_path_obj, registry = _load_registry(cfg)
+        registry_valid = True
+        registry_error = ""
+    except Exception as exc:
+        return jsonify(
+            {
+                "status": "degraded",
+                "backend": "index-tts2",
+                "engine_state": status["state"],
+                "index_tts_available": available,
+                "unavailable_reason": reason,
+                "available_versions": versions,
+                "model_version": _normalize_model_version_for_config(cfg.get("index_tts_model_version", "IndexTTS-2")),
+                "voice_mode": "invalid",
+                "routing_mode": "invalid",
+                "forced_voice_id": "",
+                "forced_model_key": "",
+                "forced_prompt_key": "",
+                "active_voice_id": "",
+                "active_cfg_path": "",
+                "cfg_valid": False,
+                "cfg_error": str(exc),
+                "default_prompt": "",
+                "override_request_prompt": False,
+                "prompt_override_active": False,
+                "prompt_valid": False,
+                "prompt_error": str(exc),
+                "registry_path": str(reg_path_obj),
+                "registry_valid": False,
+                "registry_error": str(exc),
+                "voices_count": 0,
+                "bindings_count": 0,
+                "bindings_valid": False,
+                "invalid_bindings": {},
+                "official_cfg_path": "",
+                "official_cfg_valid": False,
+                "index_tts_cfg_path_env_ignored": env_cfg_ignored,
+                "hot_reload_supported": True,
+                "shared_root": str(SHARED_ROOT),
+                "engine_root": str(ENGINE_ROOT) if ENGINE_ROOT else None,
+            }
+        )
+
+    routing = registry.get("heygem_routing") or {}
+    routing_mode = str(routing.get("global_mode") or "auto").strip()
+    forced_voice_id = str(routing.get("forced_voice_id") or "").strip()
+    forced_model_key = str(routing.get("forced_model_key") or "").strip()
+    forced_prompt_key = str(routing.get("forced_prompt_key") or "").strip()
+    voices_count = len(registry.get("voices") or [])
+    bindings_count, bindings_valid, invalid_bindings = _audit_bindings(registry)
+
+    model_version = _normalize_model_version_for_config(cfg.get("index_tts_model_version", "IndexTTS-2"))
+    official_cfg_path = ""
+    official_cfg_valid = False
+    official_error = ""
+    try:
+        official_cfg_path = str(_validate_official_base(model_version))
+        official_cfg_valid = True
+    except Exception as exc:
+        official_error = str(exc)
+
+    active_voice_id = "official_base"
+    active_cfg_path = official_cfg_path
+    default_prompt = ""
+    cfg_valid = official_cfg_valid
+    cfg_error = official_error
+    prompt_valid = True
+    prompt_error = ""
+    voice_mode = "base" if routing_mode == "force_official" else "auto"
+    override_enabled = False
+    prompt_override_active = False
+
+    if routing_mode == "force_voice":
+        model_version = "IndexTTS-2"
+        override_enabled = True
+        prompt_override_active = True
         try:
-            active_cfg_path, voice_mode = _resolve_and_validate_cfg_path(model_version, raw_custom_cfg)
+            assets = _resolve_bound_voice_assets(
+                registry,
+                voice_id=forced_voice_id,
+                model_key=forced_model_key,
+                prompt_key=forced_prompt_key,
+                context_label="全局强制声音模式(force_voice)",
+            )
+            active_voice_id = assets.voice_id
+            active_cfg_path = assets.cfg_path
+            default_prompt = str(assets.prompt_path).replace("\\", "/")
+            voice_mode = "personal"
+            cfg_valid = True
+            cfg_error = ""
+            prompt_valid = True
+            prompt_error = ""
         except Exception as exc:
-            active_cfg_path = raw_custom_cfg
+            active_voice_id = forced_voice_id or ""
+            active_cfg_path = ""
             voice_mode = "invalid"
             cfg_valid = False
             cfg_error = str(exc)
-
-    override_enabled, prompt_override_active, default_prompt, prompt_valid, prompt_error = _inspect_prompt_override_status(
-        cfg, voice_mode
-    )
+            prompt_valid = False
+            prompt_error = str(exc)
+    elif routing_mode == "force_official":
+        voice_mode = "base"
+        active_voice_id = "official_base"
+    else:
+        voice_mode = "auto"
+        active_voice_id = "auto"
 
     return jsonify(
         {
-            "status": "ok" if (available and cfg_valid and prompt_valid) else "degraded",
+            "status": "ok" if (available and registry_valid and cfg_valid and prompt_valid) else "degraded",
             "backend": "index-tts2",
             "engine_state": status["state"],
             "index_tts_available": available,
@@ -1189,6 +1847,11 @@ def healthz() -> Response:
             "available_versions": versions,
             "model_version": model_version,
             "voice_mode": voice_mode,
+            "routing_mode": routing_mode,
+            "forced_voice_id": forced_voice_id,
+            "forced_model_key": forced_model_key,
+            "forced_prompt_key": forced_prompt_key,
+            "active_voice_id": active_voice_id,
             "active_cfg_path": active_cfg_path,
             "cfg_valid": cfg_valid,
             "cfg_error": cfg_error,
@@ -1197,6 +1860,17 @@ def healthz() -> Response:
             "prompt_override_active": prompt_override_active,
             "prompt_valid": prompt_valid,
             "prompt_error": prompt_error,
+            "registry_path": str(reg_path_obj),
+            "registry_valid": registry_valid,
+            "registry_error": registry_error,
+            "voices_count": voices_count,
+            "bindings_count": bindings_count,
+            "bindings_valid": bindings_valid,
+            "invalid_bindings": invalid_bindings,
+            "official_cfg_path": official_cfg_path,
+            "official_cfg_valid": official_cfg_valid,
+            "index_tts_cfg_path_env_ignored": env_cfg_ignored,
+            "hot_reload_supported": True,
             "shared_root": str(SHARED_ROOT),
             "engine_root": str(ENGINE_ROOT) if ENGINE_ROOT else None,
         }
@@ -1212,6 +1886,20 @@ def tts_capabilities() -> Response:
     except Exception as exc:
         current_cfg = dict(DEFAULT_CONFIG)
         config_error = str(exc)
+
+    registry_valid = False
+    routing_mode = "invalid"
+    voices_count = 0
+    bindings_count = 0
+    try:
+        _, registry = _load_registry(current_cfg)
+        registry_valid = True
+        routing_mode = str((registry.get("heygem_routing") or {}).get("global_mode") or "auto")
+        voices_count = len(registry.get("voices") or [])
+        bindings_count, _, _ = _audit_bindings(registry)
+    except Exception:
+        pass
+
     return jsonify(
         {
             "available": available and not config_error,
@@ -1222,6 +1910,10 @@ def tts_capabilities() -> Response:
             "default_config": DEFAULT_CONFIG,
             "current_config": current_cfg,
             "config_error": config_error,
+            "registry_valid": registry_valid,
+            "routing_mode": routing_mode,
+            "voices_count": voices_count,
+            "bindings_count": bindings_count,
         }
     )
 
@@ -1314,7 +2006,7 @@ def preprocess_and_tran() -> Response:
 def invoke() -> Response:
     global _SYNTH_ACTIVE, _SYNTH_GEN
     job_id = uuid.uuid4().hex[:8]
-    # 阶段 1：在获取 _GENERATE_LOCK 前完成参数与文件路径校验，失败直接返回 400，绝不覆盖正在合成中的任务状态
+    # 阶段 1：在获取 _GENERATE_LOCK 前完成参数、多声音路由与文件路径校验，失败直接返回 400，绝不覆盖正在合成中的任务状态
     try:
         config = _load_config()
         payload = request.get_json(silent=True)
@@ -1329,10 +2021,16 @@ def invoke() -> Response:
         if not text:
             return jsonify({"code": 1, "msg": "待合成文本 text 不能为空"}), 400
 
+        _, registry = _load_registry(config)
         params = _resolve_effective_params(config, payload, text)
-        prompt_path, prompt_overridden, requested_prompt = _resolve_invoke_prompt(
-            config, payload, params["voice_mode"]
-        )
+        route = _resolve_invoke_routing(config, registry, payload, params)
+        params["model_version"] = route.model_version
+        params["cfg_path"] = route.cfg_path if route.voice_mode == "personal" else ""
+        params["active_cfg_path"] = route.cfg_path
+        params["voice_mode"] = route.voice_mode
+        prompt_path = route.prompt_path
+        prompt_overridden = route.prompt_overridden
+        requested_prompt = route.requested_raw
     except (FileNotFoundError, ValueError, TypeError) as exc:
         logger.warning("IndexTTS2 pre-validation rejected (job=%s): %s", job_id, exc)
         return jsonify({"code": 1, "msg": str(exc)}), 400
@@ -1348,30 +2046,19 @@ def invoke() -> Response:
                 _SYNTH_GEN += 1
                 _SYNTH_ACTIVE = True
             try:
-                if prompt_overridden:
-                    logger.info(
-                        "Personal voice mode prompt override active (job=%s): ignoring incoming reference_audio=%s -> using personal prompt=%s (cfg=%s)",
-                        job_id,
-                        requested_prompt,
-                        prompt_path,
-                        params.get("active_cfg_path"),
-                    )
-                elif params["voice_mode"] == "personal" and _extract_respect_request_prompt(payload) and requested_prompt:
-                    logger.info(
-                        "Personal voice mode opt-out (job=%s, respect_request_prompt=true): using requested reference_audio=%s",
-                        job_id,
-                        prompt_path,
-                    )
                 logger.info(
-                    "Synthesizing job=%s prompt=%s voice_mode=%s cfg=%s prompt_overridden=%s chars=%d segs=%d model=%s profile=%s beams=%d steps=%d emo=%s speed=%.2f",
+                    "Synthesizing job=%s routing_mode=%s voice_id=%s voice_mode=%s avatar_stem=%s prompt=%s cfg=%s prompt_overridden=%s chars=%d segs=%d model=%s profile=%s beams=%d steps=%d emo=%s speed=%.2f",
                     job_id,
+                    route.routing_mode,
+                    route.voice_id,
+                    route.voice_mode,
+                    route.avatar_stem,
                     prompt_path,
-                    params["voice_mode"],
-                    params.get("active_cfg_path"),
+                    route.cfg_path,
                     prompt_overridden,
                     len(text),
                     len(params["segments"]),
-                    params["model_version"],
+                    route.model_version,
                     params["profile_name"],
                     params["num_beams"],
                     params["diffusion_steps"],
@@ -1396,9 +2083,15 @@ def invoke() -> Response:
         sf.write(buffer, audio, sample_rate, format="WAV")
         resp = Response(buffer.getvalue(), mimetype="audio/wav")
         resp.headers["X-TTS-Job-Id"] = job_id
-        resp.headers["X-TTS-Model-Version"] = params["model_version"]
-        resp.headers["X-TTS-Voice-Mode"] = params.get("voice_mode", "base")
+        resp.headers["X-TTS-Model-Version"] = route.model_version
+        resp.headers["X-TTS-Voice-Id"] = route.voice_id if route.voice_id.isascii() else quote(route.voice_id)
+        resp.headers["X-TTS-Routing-Mode"] = route.routing_mode
+        resp.headers["X-TTS-Voice-Mode"] = route.voice_mode
         resp.headers["X-TTS-Prompt-Overridden"] = "true" if prompt_overridden else "false"
+        resp.headers["X-TTS-Binding-Matched"] = "true" if route.binding_matched else "false"
+        resp.headers["X-TTS-Avatar-Stem"] = (
+            route.avatar_stem if route.avatar_stem.isascii() else quote(route.avatar_stem)
+        )
         resp.headers["X-TTS-Duration-Sec"] = f"{len(audio) / sample_rate:.3f}"
         return resp
     except InterruptedError as exc:

@@ -841,7 +841,7 @@ def api_list_models(group_id: str | None = None, q: str | None = None) -> dict[s
         if q and q.strip():
             sql += " AND m.name LIKE ?"
             params.append(f"%{q.strip()}%")
-        sql += " ORDER BY m.id DESC"
+        sql += " ORDER BY (SELECT COUNT(*) FROM video v WHERE v.model_id = m.id) DESC, m.id DESC"
         rows = conn.execute(sql, params).fetchall()
         items = [_resolve_model_files(dict(r)) for r in rows]
         return {"items": items, "total": len(items)}
@@ -2733,6 +2733,24 @@ def trigger_cloud_sync_now() -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="请先填写并保存 Colab 云端创作台网址")
     threading.Thread(target=cloud_sync_manager.sync_once, name="CloudSyncManual", daemon=True).start()
     return {"ok": True, "message": "已立即在后台检查云端新成片"}
+
+
+@app.post("/api/v1/cloud-sync/pull/{video_id}", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def manual_pull_cloud_video(video_id: int) -> dict[str, Any]:
+    st = cloud_sync_manager.get_status()
+    if not st.get("cloud_url"):
+        raise HTTPException(status_code=400, detail="请先填写并保存 Colab 云端创作台网址")
+    if st.get("active_download"):
+        raise HTTPException(status_code=409, detail="当前正有一条视频正在拉取中，请等它拉完再点")
+
+    def _run() -> None:
+        try:
+            cloud_sync_manager.pull_video_now(video_id, force=True)
+        except Exception as exc:
+            cloud_sync_manager._log_event(f"手动拉取 #{video_id} 失败：{exc}")
+
+    threading.Thread(target=_run, name=f"CloudSyncPull-{video_id}", daemon=True).start()
+    return {"ok": True, "message": f"已开始 8 线程高速拉回云端 #{video_id} 号视频"}
 
 
 @app.post("/api/v1/cloud-sync/open-folder", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
