@@ -4,8 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>数字人一体化工作台 · 本机创作台</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%232f81f7'/%3E%3Cpolygon points='25 19 46 32 25 45 25 19' fill='white'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261125" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231d4ed8'/%3E%3Cpolygon points='25 19 46 32 25 45 25 19' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261125-light" />
 </head>
 <body>
 <div class="app-shell">
@@ -97,35 +97,42 @@
 
     <main class="main-scroll" id="mainContent">
 
-      <!-- ==================== 视图 1：做视频 ==================== -->
+      <!-- ==================== 视图 1：做视频（上大下宽） ==================== -->
       <section class="view active" id="view-create">
-        <div id="liveMonitorPanel" class="hidden" style="margin-bottom:16px;"></div>
+        <div class="studio-stack">
+          <div id="liveMonitorPanel" class="hidden"></div>
 
-        <div class="studio-split">
-          <!-- 左栏：出镜形象 -->
+          <!-- 上区：大尺寸竖版出镜形象全景画廊 -->
           <div class="studio-pane">
             <div class="pane-head">
-              <h2>出镜形象 <span class="meta-num" id="createModelCountBadge">0</span></h2>
-              <button class="btn btn-xs btn-secondary" id="btnQuickPickVideo" onclick="handleQuickAddModelClick()">+ 添加形象</button>
-            </div>
-
-            <div class="filter-bar" id="createModelFilterBar">
-              <input class="field-input field-sm" id="createModelSearch" placeholder="搜索形象..." autocomplete="off" oninput="renderCreateModelList()" />
-              <select class="field-input field-sm" id="createModelGroupFilter" onchange="renderCreateModelList()">
-                <option value="all">全部分组</option>
-              </select>
+              <div class="inline-row" style="gap:10px;">
+                <h2>出镜形象 <span class="meta-num" id="createModelCountBadge">0</span></h2>
+                <div id="selectedAvatarBar"></div>
+              </div>
+              <div class="gallery-head-controls">
+                <div class="inline-row" id="createModelFilterBar" style="gap:6px;">
+                  <input class="field-input field-sm" id="createModelSearch" style="width:160px;" placeholder="搜索形象..." autocomplete="off" oninput="renderCreateModelList()" />
+                  <select class="field-input field-sm" id="createModelGroupFilter" style="width:116px;" onchange="renderCreateModelList()">
+                    <option value="all">全部分组</option>
+                  </select>
+                </div>
+                <button class="btn btn-xs btn-secondary hidden" id="btnToggleAvatarExpand" onclick="toggleAvatarGalleryExpand()">展开全部</button>
+                <button class="btn btn-xs btn-primary" id="btnQuickPickVideo" onclick="handleQuickAddModelClick()">+ 添加形象</button>
+              </div>
             </div>
 
             <div id="step1ImportingBanner" class="inline-status-box hidden"></div>
             <input type="file" id="quickUploadVideoInput" accept="video/*" style="display:none;" onchange="handleQuickUploadModelFile(this.files?.[0])" />
 
             <div id="createModelList"></div>
-            <div id="selectedAvatarBar"></div>
+            <div id="stageModelVoiceWrap" class="hidden" style="margin-top:10px;">
+              <audio id="stageModelVoicePlayer" class="audio-player" controls></audio>
+            </div>
             <div id="createDiscoverCompact"></div>
             <div id="createMissingBanner" class="hidden"></div>
           </div>
 
-          <!-- 右栏：口播内容与生成 -->
+          <!-- 下区：全宽口播内容与生成创作台 -->
           <div class="studio-pane">
             <div class="pane-head">
               <h2>口播内容</h2>
@@ -145,7 +152,7 @@
                     <button class="btn-link" onclick="clearScriptInput()">清空</button>
                   </div>
                 </div>
-                <textarea class="field-textarea" id="ttsTextInput" rows="7" placeholder="粘贴或输入要让数字人说的话，支持长文案自动分段配音..." oninput="onScriptInputChanged()"></textarea>
+                <textarea class="field-textarea" id="ttsTextInput" rows="5" placeholder="粘贴或输入要让数字人说的话，支持长文案自动分段配音..." oninput="onScriptInputChanged()"></textarea>
               </div>
 
               <div class="field-grid-2">
@@ -902,6 +909,6 @@ GET  /api/v1/jobs/{id}/download 下载成片</div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
-<script src="/static/app.js?v=20261125"></script>
+<script src="/static/app.js?v=20261125-light"></script>
 </body>
 </html>

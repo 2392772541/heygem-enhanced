@@ -53,6 +53,7 @@ const state = {
   lastDisconnectReason: "",
   cloudSyncActive: false,
   cloudSyncDrawerOpen: false,
+  avatarGalleryExpanded: false,
   prefsLoaded: false,
   preferredVoiceId: "",
 };
@@ -1079,6 +1080,11 @@ function buildDiscoverHtml(unimportedList, compact = false) {
     </div>`;
 }
 
+function toggleAvatarGalleryExpand() {
+  state.avatarGalleryExpanded = !state.avatarGalleryExpanded;
+  renderCreateModelList();
+}
+
 function renderSelectedAvatarBar() {
   const bar = document.getElementById("selectedAvatarBar");
   if (!bar) return;
@@ -1088,17 +1094,11 @@ function renderSelectedAvatarBar() {
     return;
   }
   bar.innerHTML = `
-    <div class="selected-avatar-bar">
-      <div style="min-width:0;flex:1;">
-        <div class="avatar-name">已选：${esc(sel.name)}</div>
-        <div class="avatar-sub">${fmtSizeMb(sel.video_size_mb)} · ${sel.audio_exists ? "含原声" : "无原声"}</div>
-      </div>
-      <div class="inline-row" style="gap:4px;">
-        <button class="btn btn-xs btn-secondary" onclick="previewModelVideo(${sel.id})">预览</button>
-        ${sel.audio_exists ? `<button class="btn btn-xs btn-secondary" onclick="playSelectedModelVoice()">听原声</button>` : ""}
-      </div>
-    </div>
-    ${sel.audio_exists ? `<div id="stageModelVoiceWrap" class="hidden" style="margin-top:8px;"><audio id="stageModelVoicePlayer" class="audio-player" controls></audio></div>` : ""}`;
+    <div class="selected-avatar-pill">
+      <span>已选：${esc(sel.name)}</span>
+      <button class="btn-link" onclick="previewModelVideo(${sel.id})">预览</button>
+      ${sel.audio_exists ? `<button class="btn-link" onclick="playSelectedModelVoice()">听原声</button>` : ""}
+    </div>`;
 }
 
 function playSelectedModelVoice() {
@@ -1162,10 +1162,17 @@ function renderCreateModelList() {
       return true;
     });
 
+    const expBtn = document.getElementById("btnToggleAvatarExpand");
+    if (expBtn) {
+      const needToggle = filtered.length > 6;
+      expBtn.classList.toggle("hidden", !needToggle);
+      expBtn.textContent = state.avatarGalleryExpanded ? "收起为单排" : `展开全部 (${filtered.length})`;
+    }
+
     if (!filtered.length) {
       list.innerHTML = `<div class="empty-box">没有匹配的出镜形象</div>`;
     } else {
-      list.innerHTML = `<div class="avatar-grid">
+      list.innerHTML = `<div class="avatar-gallery ${state.avatarGalleryExpanded ? "expanded" : ""}">
         ${filtered.map((m) => {
           const sel = m.id === state.selectedModelId;
           return `
@@ -1189,8 +1196,8 @@ function renderCreateModelList() {
   if (missingModels.length > 0 && missingWrap) {
     missingWrap.classList.remove("hidden");
     missingWrap.innerHTML = `
-      <div class="inline-row-between" style="margin-top:10px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--warn-tint);font-size:12px;">
-        <span style="color:#f6d57a;">有 ${missingModels.length} 条历史形象视频缺失</span>
+      <div class="inline-row-between" style="margin-top:10px;padding:8px 12px;border-radius:var(--radius-sm);background:var(--warn-tint);font-size:12.5px;">
+        <span style="color:var(--warn-text);">有 ${missingModels.length} 条历史形象视频缺失</span>
         <button class="btn-link" onclick="switchView('models')">去处理</button>
       </div>`;
   } else if (missingWrap) {
@@ -2273,7 +2280,7 @@ function renderLiveMonitor() {
             <button class="icon-btn" style="width:26px;height:26px;" onclick="dismissBannerJob(${j.id})" aria-label="关闭">${SVG_CLOSE}</button>
           </div>
         </div>
-        <div class="muted-text" style="color:#ffc1bc;font-size:12px;">${esc(j.message || j.error_detail)}</div>
+        <div class="muted-text" style="color:var(--danger-text);font-size:12px;">${esc(j.message || j.error_detail)}</div>
       </div>`;
   });
 
@@ -2997,7 +3004,7 @@ function renderModelsManageView() {
             ${m.video_exists
               ? `<img src="${esc(m.thumb_url)}" alt="${esc(m.name)}" loading="lazy" data-preview="${esc(m.preview_url)}" onerror="handleThumbFallback(this, this.dataset.preview)" />
                  <div class="play-overlay"><div class="play-circle">${SVG_PLAY}</div></div>`
-              : `<div class="media-cover-placeholder" style="color:#ff9c95;">原视频缺失 · 点击补回</div>`}
+              : `<div class="media-cover-placeholder" style="color:var(--danger-text);">原视频缺失 · 点击补回</div>`}
             <div class="cover-pills">
               <span class="cover-pill ${m.video_exists ? "ok" : "err"}">${m.video_exists ? fmtSizeMb(m.video_size_mb) : "文件缺失"}</span>
             </div>
