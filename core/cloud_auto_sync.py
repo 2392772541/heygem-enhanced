@@ -394,24 +394,23 @@ class CloudAutoSyncManager:
             return f"{vid}:{code}"
         return f"{vid}:{created}"
 
-    def _build_local_filename(self, video: dict[str, Any], quality: str) -> str:
+    def _build_local_filename(self, video: dict[str, Any], quality: str, save_dir: Path | None = None) -> str:
+        """清爽可读文件名：直接沿用作品名（去掉长串乱码后缀），仅撞名时自动追加序号。"""
         vid = int(video.get("id") or 0)
-        name = _safe_filename(str(video.get("name") or f"视频{vid}"), fallback=f"视频{vid}")
+        raw_name = str(video.get("name") or "").strip()
         model = _safe_filename(str(video.get("model_name") or ""), fallback="")
-        code8 = re.sub(r"[^a-zA-Z0-9]+", "", str(video.get("code") or ""))[:8]
-        created_ms = int(video.get("created_at") or 0)
-        day = time.strftime("%Y%m%d", time.localtime(created_ms / 1000.0)) if created_ms > 1_000_000_000_000 else time.strftime("%Y%m%d")
-        tag = "4K原画压小" if quality != "original" else "原片"
-        parts = [f"云端成品_{vid}"]
-        if name and name not in ("1", "2", "3", str(vid)):
-            parts.append(name)
-        elif model:
-            parts.append(model)
-        parts.append(day)
-        if code8:
-            parts.append(code8)
-        parts.append(tag)
-        return "_".join(parts) + ".mp4"
+        clean_name = _safe_filename(raw_name, fallback="")
+        if not clean_name or clean_name in ("1", "2", "3", str(vid)):
+            base = f"{model or '数字人'}_{vid}"
+        elif model and model not in clean_name and len(clean_name) <= 18:
+            base = f"{clean_name}_{model}"
+        else:
+            base = clean_name
+        suffix = "_原片" if quality == "original" else ""
+        cand = f"{base}{suffix}.mp4"
+        if save_dir is not None and (save_dir / cand).exists():
+            cand = f"{base}_{vid}{suffix}.mp4"
+        return cand
 
     def _existing_local_match(self, save_dir: Path, video: dict[str, Any], quality: str) -> Path | None:
         """严格按唯一任务 code8 匹配本地已有成片，避免把不同天/不同任务的同序号视频误判为已下载。"""
@@ -617,7 +616,7 @@ class CloudAutoSyncManager:
             raise RuntimeError("云端未返回有效文件长度")
         accept_ranges = "bytes" in (hdrs.get("accept-ranges") or "").lower()
 
-        dst_name = self._build_local_filename(video, quality)
+        dst_name = self._build_local_filename(video, quality, save_dir=save_dir)
         dst = save_dir / dst_name
         part = dst.with_name(dst.name + ".part")
 

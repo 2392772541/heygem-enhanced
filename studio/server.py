@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -2020,8 +2021,19 @@ def _create_jobs_atomically(items: list[JobCreateItem]) -> list[dict[str, Any]]:
 
             job_name = (item.name or "").strip()
             if not job_name:
-                snippet = sanitize_filename(text_content[:18], "") if text_content else ""
-                job_name = f"{model['name']}_{snippet or time.strftime('%m%d_%H%M%S')}"
+                mname = sanitize_filename(str(model["name"] or ""), "")[:16]
+                if spec["audio_mode"] in ("audio_asset", "audio_path") and source_audio_abs:
+                    stem = Path(source_audio_abs).stem
+                    stem = re.sub(r"^(?:20\d{6}[_-]?\d{6}|\d{10,18})[_-]?", "", stem)
+                    stem = re.sub(r"[_-]?20\d{6}(?:[_-]?\d{6})?$", "", stem)
+                    clean_a = sanitize_filename(stem, "")[:24]
+                    job_name = f"{clean_a}_{mname}" if (clean_a and mname) else (clean_a or f"{mname}_{time.strftime('%m%d_%H%M')}")
+                elif text_content:
+                    plain = re.sub(r"[\s\r\n，。！？、；：“”‘’（）()【】\[\]《》<>—…·.,!?;:'\"`~@#$%^&*+=|/\\-]+", "", text_content.strip())
+                    snippet = sanitize_filename(plain[:10], "")
+                    job_name = f"{snippet}_{mname}" if (snippet and mname) else (snippet or f"{mname}_{time.strftime('%m%d_%H%M')}")
+                else:
+                    job_name = f"{mname}_{time.strftime('%m%d_%H%M')}" if mname else f"视频_{time.strftime('%m%d_%H%M')}"
 
             cur = conn.execute(
                 """
