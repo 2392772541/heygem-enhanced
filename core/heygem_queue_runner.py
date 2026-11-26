@@ -2504,7 +2504,7 @@ def _fail_video_permanently(video_id: int, error_code: str, message: str, detail
     )
 
 
-def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
+def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row | None) -> str:
     video_id = int(video["id"])
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     speaker = str(uuid.uuid4())
@@ -2516,38 +2516,48 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
         if not is_index_tts2_ready(timeout=4):
             raise RuntimeError("index-tts2 adapter is not ready on 127.0.0.1:18180")
 
-    selected_voice, reference_audio = pick_voice_for_tts(voice, tts_mode)
-    reference_audio = maybe_shorten_reference_audio(reference_audio, tts_mode, video_id)
-    reference_text = str(selected_voice["reference_audio_text"] or "")
+    tts_params = _load_job_tts_params(video_id)
+    explicit_ref = str(tts_params.get("reference_audio") or "").strip().strip('"').strip("'")
+    if tts_mode == "index-tts2" and explicit_ref and Path(explicit_ref).is_file():
+        reference_audio = explicit_ref.replace("\\", "/")
+        reference_text = ""
+        log(f"video {video_id} using explicit tone reference audio: {reference_audio}")
+    else:
+        if voice is None:
+            raise ValueError("未找到可用的参考音色，且未指定自定义语气参考音频。")
+        selected_voice, reference_audio = pick_voice_for_tts(voice, tts_mode)
+        reference_audio = maybe_shorten_reference_audio(reference_audio, tts_mode, video_id)
+        reference_text = str(selected_voice["reference_audio_text"] or "")
 
-    if tts_mode == "fish-speech":
-        target_count = choose_fish_reference_count()
-        gpu_mem = get_primary_gpu_memory_mb()
-        ref_parts = _reference_candidates(reference_audio)
-        if len(ref_parts) < target_count and ref_parts:
-            ref_parts.extend([ref_parts[-1]] * (target_count - len(ref_parts)))
-        if len(ref_parts) > target_count:
-            ref_parts = ref_parts[:target_count]
-        reference_audio = "|||".join(ref_parts)
-        if gpu_mem is not None:
-            total_mb, used_mb = gpu_mem
-            free_mb = max(0, total_mb - used_mb)
-            log(
-                f"video {video_id} fish refs={len(ref_parts)} "
-                f"(target={target_count}, gpu_free={free_mb}MB/{total_mb}MB)"
-            )
+        if tts_mode == "fish-speech":
+            target_count = choose_fish_reference_count()
+            gpu_mem = get_primary_gpu_memory_mb()
+            ref_parts = _reference_candidates(reference_audio)
+            if len(ref_parts) < target_count and ref_parts:
+                ref_parts.extend([ref_parts[-1]] * (target_count - len(ref_parts)))
+            if len(ref_parts) > target_count:
+                ref_parts = ref_parts[:target_count]
+            reference_audio = "|||".join(ref_parts)
+            if gpu_mem is not None:
+                total_mb, used_mb = gpu_mem
+                free_mb = max(0, total_mb - used_mb)
+                log(
+                    f"video {video_id} fish refs={len(ref_parts)} "
+                    f"(target={target_count}, gpu_free={free_mb}MB/{total_mb}MB)"
+                )
 
-        text_parts = [part.strip() for part in reference_text.split("|||") if part.strip()]
-        if text_parts:
-            if len(text_parts) < len(ref_parts):
-                text_parts.extend([text_parts[-1]] * (len(ref_parts) - len(text_parts)))
-            elif len(text_parts) > len(ref_parts):
-                text_parts = text_parts[: len(ref_parts)]
-            reference_text = "|||".join(text_parts)
+            text_parts = [part.strip() for part in reference_text.split("|||") if part.strip()]
+            if text_parts:
+                if len(text_parts) < len(ref_parts):
+                    text_parts.extend([text_parts[-1]] * (len(ref_parts) - len(text_parts)))
+                elif len(text_parts) > len(ref_parts):
+                    text_parts = text_parts[: len(ref_parts)]
+                reference_text = "|||".join(text_parts)
 
-    original_reference_audio = str(voice["asr_format_audio_url"] or "").replace("\\", "/")
-    if reference_audio != original_reference_audio.replace("\\", "/"):
-        log(f"video {video_id} mapped reference audio for {tts_mode}: {reference_audio}")
+        original_reference_audio = str(voice["asr_format_audio_url"] or "").replace("\\", "/")
+        if reference_audio != original_reference_audio.replace("\\", "/"):
+            log(f"video {video_id} mapped reference audio for {tts_mode}: {reference_audio}")
+
     if not reference_audio_exists(reference_audio, tts_mode):
         raise FileNotFoundError(
             f"参考音色文件缺失（mode={tts_mode}）：{reference_audio}。请在「模特与音色」页面检查该音色文件。"
@@ -2559,7 +2569,6 @@ def make_audio_for_video(video: sqlite3.Row, voice: sqlite3.Row) -> str:
 
     # IndexTTS2 模式：整段文案单次发给适配器（内部按句分段、只加载一次模型、不重复冷启动），同时实时轮询进度与中断信号
     if tts_mode == "index-tts2":
-        tts_params = _load_job_tts_params(video_id)
         payload: dict[str, object] = {
             "speaker": speaker,
             "format": "wav",
@@ -2995,11 +3004,19 @@ def run_one(video: sqlite3.Row) -> None:
     audio_path = str(video["audio_path"] or "").strip()
     voice: sqlite3.Row | None = None
     if not audio_path:
-        try:
-            voice_id = int(video["voice_id"] or model["voice_id"])
-            voice = fetch_voice(voice_id)
-        except Exception as exc:
-            _fail_video_permanently(video_id, "VOICE_NOT_FOUND", f"找不到可用音色配置：{exc}", str(exc))
+        job_tts_params = _load_job_tts_params(video_id)
+        custom_ref = str(job_tts_params.get("reference_audio") or "").strip().strip('"').strip("'")
+        has_custom_ref = bool(custom_ref and Path(custom_ref).is_file())
+        raw_vid = video["voice_id"] or model["voice_id"]
+        if raw_vid:
+            try:
+                voice = fetch_voice(int(raw_vid))
+            except Exception as exc:
+                if not has_custom_ref:
+                    _fail_video_permanently(video_id, "VOICE_NOT_FOUND", f"找不到可用音色配置：{exc}", str(exc))
+                    return
+        elif not has_custom_ref:
+            _fail_video_permanently(video_id, "VOICE_NOT_FOUND", "找不到可用音色配置，且未指定专属声音语气")
             return
 
     run_started_at_ms = int(time.time() * 1000)
@@ -3051,7 +3068,6 @@ def run_one(video: sqlite3.Row) -> None:
                 )
                 return
         else:
-            assert voice is not None
             audio_name = make_audio_for_video(video, voice)
     except InterruptedError:
         log(f"[CANCEL] video {video_id} cancelled cleanly during audio prep")

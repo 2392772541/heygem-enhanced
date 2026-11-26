@@ -11,6 +11,7 @@ const VIEW_TITLES = {
 };
 
 const SVG_PLAY = `<svg class="ico ico-sm" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20 7 4"></polygon></svg>`;
+const SVG_PAUSE = `<svg class="ico ico-sm" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>`;
 const SVG_CHECK = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
 const SVG_EDIT = `<svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>`;
 const SVG_CLOSE = `<svg class="ico ico-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
@@ -21,10 +22,12 @@ const state = {
   emoMode: "same_as_speaker",
   taskFilter: "all",
   libraryType: "videos",
+  librarySourceFilter: "available",
   selectedCategoryId: "all",
   modelSubTab: "models",
   logSource: "queue",
   selectedModelId: null,
+  inlinePlayingModelId: null,
   selectedAudioIds: new Set(),
   lastAuditionAsset: null,
   health: null,
@@ -32,10 +35,19 @@ const state = {
   discoveredVideos: [],
   modelGroups: [],
   voices: [],
+  registeredVoices: [],
+  selectedPersonalVoiceId: "",
+  selectedPersonalPromptKey: "",
+  auditionPlayingKey: "",
   categories: [],
   presets: [],
   jobs: [],
   audios: [],
+  voiceSourceFilter: "all",
+  voiceBatchMode: false,
+  voiceBatchIds: new Set(),
+  voiceVisibleLimit: 10,
+  voicePlayingAudioId: null,
   ttsPollingTimer: null,
   openTaskErrIds: new Set(),
   openTaskLogIds: new Set(),
@@ -53,6 +65,7 @@ const state = {
   lastDisconnectReason: "",
   cloudSyncActive: false,
   cloudSyncDrawerOpen: false,
+  lastCloudSyncStatus: null,
   avatarGalleryExpanded: false,
   prefsLoaded: false,
   preferredVoiceId: "",
@@ -152,6 +165,15 @@ function esc(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function escJs(str) {
+  return String(str ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, "&quot;")
+    .replace(/\r/g, "")
+    .replace(/\n/g, "\\n");
 }
 
 function toast(msg, type = "info", duration = 3600) {
@@ -474,7 +496,7 @@ function clearBackendDisconnected() {
 
 function updateNavCounters() {
   const activeCnt = state.jobs.filter((j) => j.status === "pending" || j.status === "waiting").length;
-  const successCnt = state.jobs.filter((j) => j.status === "success").length;
+  const availableCnt = getUnifiedPlayableVideos().length;
   const navAct = document.getElementById("navActiveCount");
   const navSuc = document.getElementById("navSuccessCount");
   const navMod = document.getElementById("navModelCount");
@@ -482,7 +504,7 @@ function updateNavCounters() {
     navAct.textContent = activeCnt;
     navAct.classList.toggle("hidden", activeCnt === 0);
   }
-  if (navSuc) navSuc.textContent = successCnt;
+  if (navSuc) navSuc.textContent = availableCnt;
   if (navMod) navMod.textContent = getValidModels().length;
   updateTopLiveChip();
 }
@@ -570,6 +592,8 @@ async function refreshAll(silent = false, forceHealth = false) {
       state.prefsLoaded = true;
       if (prefs.selectedModelId) state.selectedModelId = Number(prefs.selectedModelId);
       if (prefs.selectedVoiceId !== undefined) state.preferredVoiceId = String(prefs.selectedVoiceId);
+      if (prefs.personalVoiceId !== undefined) state.selectedPersonalVoiceId = String(prefs.personalVoiceId);
+      if (prefs.personalPromptKey !== undefined) state.selectedPersonalPromptKey = String(prefs.personalPromptKey);
       if (prefs.createMode === "audio" || prefs.createMode === "tts") {
         setCreateMode(prefs.createMode, false);
       }
@@ -578,6 +602,9 @@ async function refreshAll(silent = false, forceHealth = false) {
     const validAudioIds = new Set(state.audios.map((a) => a.id));
     for (const sid of Array.from(state.selectedAudioIds)) {
       if (!validAudioIds.has(sid)) state.selectedAudioIds.delete(sid);
+    }
+    for (const bid of Array.from(state.voiceBatchIds)) {
+      if (!validAudioIds.has(bid)) state.voiceBatchIds.delete(bid);
     }
 
     const curModel = state.models.find((m) => m.id === state.selectedModelId);
@@ -589,6 +616,7 @@ async function refreshAll(silent = false, forceHealth = false) {
     updateNavCounters();
     applyClientModeVisibility();
     renderSelectOptions();
+    renderLocalVoicePickers();
     renderCreateModelList();
     renderSelectedAvatarBar();
     updateVoicePreview();
@@ -596,6 +624,7 @@ async function refreshAll(silent = false, forceHealth = false) {
     renderCreateAudioLibrary();
     renderVoiceHistoryList();
     renderLiveMonitor();
+    renderCreateRecentResults();
     updateWizardIndicators();
     syncTuneSummaryAll();
 
@@ -914,7 +943,7 @@ function updateWizardIndicators() {
     .filter(Boolean);
   const audioCount = state.selectedAudioIds.size + pastedAudioLines.length;
   const hasContent = state.createMode === "tts" ? text.length > 0 : audioCount > 0;
-  const effectiveVoice = state.createMode === "tts" ? getEffectiveVoiceId() : true;
+  const effectiveVoice = state.createMode === "tts" ? (getEffectiveVoiceId() || Boolean(getActivePersonalTone()?.path)) : true;
   const usableVoiceCount = state.voices.filter((v) => v.exists).length;
 
   const hint = document.getElementById("wizardReadyHint");
@@ -1119,6 +1148,37 @@ function playSelectedModelVoice() {
   }
 }
 
+function toggleInlineAvatarPlay(modelId, ev) {
+  if (ev) ev.stopPropagation();
+  if (state.inlinePlayingModelId === modelId) {
+    state.inlinePlayingModelId = null;
+  } else {
+    state.inlinePlayingModelId = modelId;
+  }
+  renderCreateModelList();
+}
+
+function stopInlineAvatarPlay() {
+  if (state.inlinePlayingModelId === null) return;
+  state.inlinePlayingModelId = null;
+  renderCreateModelList();
+}
+
+function onInlineAvatarVideoMeta(vidEl, modelId) {
+  if (!vidEl) return;
+  if (vidEl.videoWidth === 0 || vidEl.videoHeight === 0) {
+    state.inlinePlayingModelId = null;
+    renderCreateModelList();
+    previewModelVideo(modelId);
+  }
+}
+
+function onInlineAvatarVideoError(modelId) {
+  state.inlinePlayingModelId = null;
+  renderCreateModelList();
+  previewModelVideo(modelId);
+}
+
 function renderCreateModelList() {
   const list = document.getElementById("createModelList");
   const filterBar = document.getElementById("createModelFilterBar");
@@ -1164,7 +1224,7 @@ function renderCreateModelList() {
 
     const expBtn = document.getElementById("btnToggleAvatarExpand");
     if (expBtn) {
-      const needToggle = filtered.length > 6;
+      const needToggle = filtered.length > 5;
       expBtn.classList.toggle("hidden", !needToggle);
       expBtn.textContent = state.avatarGalleryExpanded ? "收起为单排" : `展开全部 (${filtered.length})`;
     }
@@ -1175,13 +1235,19 @@ function renderCreateModelList() {
       list.innerHTML = `<div class="avatar-gallery ${state.avatarGalleryExpanded ? "expanded" : ""}">
         ${filtered.map((m) => {
           const sel = m.id === state.selectedModelId;
+          const isPlaying = m.id === state.inlinePlayingModelId;
+          const thumbContent = isPlaying
+            ? `<video class="avatar-inline-video" src="${esc(m.preview_url)}" poster="${esc(m.thumb_url)}" controls autoplay playsinline onclick="event.stopPropagation()" onloadedmetadata="onInlineAvatarVideoMeta(this, ${m.id})" onerror="onInlineAvatarVideoError(${m.id})"></video>
+               <div class="avatar-inline-bar">
+                 <button type="button" class="avatar-inline-ctrl" onclick="event.stopPropagation();previewModelVideo(${m.id})">放大</button>
+                 <button type="button" class="avatar-inline-ctrl" onclick="event.stopPropagation();stopInlineAvatarPlay()">关闭</button>
+               </div>`
+            : `<img src="${esc(m.thumb_url)}" alt="${esc(m.name)}" loading="lazy" data-preview="${esc(m.preview_url)}" onerror="handleThumbFallback(this, this.dataset.preview)" />
+               <span class="avatar-badge-selected" aria-hidden="true">${SVG_CHECK} 当前</span>
+               <button type="button" class="avatar-play-btn" title="直接在卡片里播放试看" onclick="toggleInlineAvatarPlay(${m.id}, event)">${SVG_PLAY}<span>试看</span></button>`;
           return `
-            <div class="avatar-tile ${sel ? "selected" : ""}" onclick="selectModel(${m.id})">
-              <div class="avatar-thumb">
-                <img src="${esc(m.thumb_url)}" alt="${esc(m.name)}" loading="lazy" data-preview="${esc(m.preview_url)}" onerror="handleThumbFallback(this, this.dataset.preview)" />
-                <span class="avatar-badge-selected" aria-hidden="true">${SVG_CHECK}</span>
-                <button class="avatar-play-mini" title="预览视频" onclick="event.stopPropagation();previewModelVideo(${m.id})">${SVG_PLAY}</button>
-              </div>
+            <div class="avatar-tile ${sel ? "selected" : ""} ${isPlaying ? "inline-playing" : ""}" onclick="selectModel(${m.id})">
+              <div class="avatar-thumb">${thumbContent}</div>
               <div class="avatar-info">
                 <div class="avatar-name" title="${esc(m.name)}">${esc(m.name)}</div>
                 <div class="avatar-sub">${fmtSizeMb(m.video_size_mb)} · ${m.audio_exists ? "有原声" : "无原声"}</div>
@@ -1606,6 +1672,80 @@ function syncPersonalVoiceFromStudio(val) {
   syncPersonalVoiceFromCreate(val);
 }
 
+function getToneCardMeta(key, rawLabel) {
+  const k = String(key || "").toLowerCase();
+  const l = String(rawLabel || "");
+  if (k.includes("natural") || k.includes("main") || l.includes("自然") || l.includes("主推")) {
+    return { title: "自然主推", badge: "推荐", desc: "日常口播首选，吐字自然流畅" };
+  }
+  if (k.includes("warm") || k.includes("explain") || l.includes("温和") || l.includes("讲解")) {
+    return { title: "温和讲解", badge: "", desc: "语气温柔亲切，适合科普分享" };
+  }
+  if (k.includes("clean") || k.includes("narrat") || l.includes("干净") || l.includes("播报")) {
+    return { title: "干净播报", badge: "", desc: "字正腔圆利落，适合正式宣讲" };
+  }
+  return { title: l || key || "默认语气", badge: "", desc: "点击右侧先听这段参考样音" };
+}
+
+function getToneAuditionAudio() {
+  if (!window.__localToneAudition) {
+    const au = new Audio();
+    au.addEventListener("ended", () => {
+      state.auditionPlayingKey = "";
+      renderLocalVoicePickers();
+    });
+    au.addEventListener("error", () => {
+      state.auditionPlayingKey = "";
+      renderLocalVoicePickers();
+      toast("该样音暂时无法播放，请检查本机样音文件", "warning");
+    });
+    window.__localToneAudition = au;
+  }
+  return window.__localToneAudition;
+}
+
+function toggleToneSampleAudition(sampleKey, sampleUrl, ev) {
+  if (ev) ev.stopPropagation();
+  if (!sampleUrl) return toast("该语气暂无可试听样音", "warning");
+  const au = getToneAuditionAudio();
+  if (state.auditionPlayingKey === sampleKey && !au.paused) {
+    au.pause();
+    state.auditionPlayingKey = "";
+    renderLocalVoicePickers();
+    return;
+  }
+  state.auditionPlayingKey = sampleKey;
+  renderLocalVoicePickers();
+  au.src = sampleUrl;
+  au.play().catch(() => {
+    state.auditionPlayingKey = "";
+    renderLocalVoicePickers();
+    toast("浏览器阻止了自动播放，请再点一次试听", "warning");
+  });
+}
+
+function getActivePersonalVoice() {
+  const items = Array.isArray(state.registeredVoices) ? state.registeredVoices : [];
+  if (!state.selectedPersonalVoiceId || state.selectedPersonalVoiceId === "auto" || state.selectedPersonalVoiceId === "other") {
+    return null;
+  }
+  return items.find((v) => String(v.voice_id) === String(state.selectedPersonalVoiceId)) || null;
+}
+
+function getActivePersonalTone() {
+  const voice = getActivePersonalVoice();
+  if (!voice) return null;
+  const prompts = Array.isArray(voice.prompts) ? voice.prompts : [];
+  if (!prompts.length) {
+    return voice.prompt_path ? { key: voice.default_prompt_key || "natural", label: "自然主推", path: voice.prompt_path, sample_url: "" } : null;
+  }
+  return (
+    prompts.find((p) => String(p.key) === String(state.selectedPersonalPromptKey)) ||
+    prompts.find((p) => String(p.key) === String(voice.default_prompt_key)) ||
+    prompts[0]
+  );
+}
+
 function populateRegisteredPersonalVoices(list) {
   const items = Array.isArray(list) ? list : [];
   state.registeredVoices = items;
@@ -1614,11 +1754,204 @@ function populateRegisteredPersonalVoices(list) {
   ["createPersonalVoiceSelect", "ttsPersonalVoiceSelect"].forEach((id) => {
     const sel = document.getElementById(id);
     if (!sel) return;
-    const prev = sel.value || "";
     sel.innerHTML = html;
-    if (prev && items.some((x) => String(x.cfg_path || "") === prev)) sel.value = prev;
-    else sel.value = "";
   });
+
+  if (!state.selectedPersonalVoiceId) {
+    const prefs = loadPrefs();
+    if (prefs.personalVoiceId) {
+      state.selectedPersonalVoiceId = String(prefs.personalVoiceId);
+      state.selectedPersonalPromptKey = String(prefs.personalPromptKey || "");
+    } else if (items.length > 0) {
+      // 默认选中第一位已训练好的专属声音及其主推语气，让用户一进页面就能看见并试听 3 种语气
+      state.selectedPersonalVoiceId = String(items[0].voice_id);
+      state.selectedPersonalPromptKey = String(items[0].default_prompt_key || items[0].prompts?.[0]?.key || "natural");
+    } else {
+      state.selectedPersonalVoiceId = "auto";
+    }
+  }
+  const active = getActivePersonalVoice();
+  syncPersonalVoiceFromCreate(active ? active.cfg_path : "");
+  renderLocalVoicePickers();
+  updateWizardIndicators();
+}
+
+function renderLocalVoicePickers() {
+  const items = Array.isArray(state.registeredVoices) ? state.registeredVoices : [];
+  const usableVoices = state.voices.filter((v) => v.exists);
+  const activeVoice = getActivePersonalVoice();
+  const activeTone = getActivePersonalTone();
+  const activeMode = activeVoice ? activeVoice.voice_id : (state.selectedPersonalVoiceId === "other" ? "other" : "auto");
+
+  const makeSpeakerPillsHtml = () => {
+    const out = [];
+    items.forEach((v) => {
+      const isAct = activeMode === v.voice_id;
+      out.push(
+        `<button type="button" class="vp-pill ${isAct ? "active" : ""}" onclick="pickLocalSpeaker('${escJs(v.voice_id)}')">${esc(v.display_name || v.voice_id)}<span class="vp-badge">专属声音</span></button>`
+      );
+    });
+    out.push(
+      `<button type="button" class="vp-pill ${activeMode === "auto" ? "active" : ""}" onclick="pickLocalSpeaker('auto')">跟随形象原声</button>`
+    );
+    if (usableVoices.length > 0) {
+      out.push(
+        `<button type="button" class="vp-pill ${activeMode === "other" ? "active" : ""}" onclick="pickLocalSpeaker('other')">其他音色 (${usableVoices.length})</button>`
+      );
+    }
+    return out.join("");
+  };
+
+  const makeToneCardsHtml = () => {
+    if (!activeVoice) return "";
+    const prompts = Array.isArray(activeVoice.prompts) ? activeVoice.prompts : [];
+    if (!prompts.length) {
+      return `<div class="muted-text" style="grid-column:1/-1;font-size:12.5px;padding-top:6px;">已匹配「${esc(activeVoice.display_name)}」主力专属声音。</div>`;
+    }
+    return prompts
+      .map((p) => {
+        const meta = getToneCardMeta(p.key, p.label);
+        const isAct = activeTone && String(activeTone.key) === String(p.key);
+        const sampleKey = `${activeVoice.voice_id}:${p.key}`;
+        const isPlay = state.auditionPlayingKey === sampleKey;
+        const sampleUrl = p.sample_url || `/api/v1/tts/registered-voice-sample/${encodeURIComponent(activeVoice.voice_id)}/${encodeURIComponent(p.key)}`;
+        return `
+          <div class="vp-tone-card ${isAct ? "active" : ""} ${isPlay ? "playing" : ""}" role="button" tabindex="0" onclick="pickLocalTone('${escJs(activeVoice.voice_id)}', '${escJs(p.key)}')">
+            <div class="vp-tone-head">
+              <div class="vp-tone-name-wrap">
+                <span class="vp-tone-name">${esc(meta.title)}</span>
+                ${meta.badge ? `<span class="vp-rec-tag">${esc(meta.badge)}</span>` : ""}
+              </div>
+            </div>
+            <div class="vp-tone-desc">${esc(meta.desc)}</div>
+            <div class="vp-tone-foot">
+              <button type="button" class="vp-audition-btn ${isPlay ? "playing" : ""}" onclick="toggleToneSampleAudition('${escJs(sampleKey)}', '${escJs(sampleUrl)}', event)">
+                ${isPlay ? SVG_PAUSE : SVG_PLAY}<span>${isPlay ? "播放中" : "听样音"}</span>
+              </button>
+            </div>
+          </div>`;
+      })
+      .join("");
+  };
+
+  const otherOptsHtml = usableVoices.map((v) => `<option value="${v.id}">${esc(v.display_name)}</option>`).join("");
+  const curVoiceVal = document.getElementById("ttsVoiceSelect")?.value || state.preferredVoiceId || (usableVoices[0] ? String(usableVoices[0].id) : "");
+
+  [
+    { pills: "createSpeakerPills", toneRow: "createToneRow", toneCards: "createToneCards", fbRow: "createFallbackVoiceRow", otherSel: "createOtherVoiceSelect", hint: "createVoiceSimpleHint" },
+    { pills: "studioSpeakerPills", toneRow: "studioToneRow", toneCards: "studioToneCards", fbRow: "studioFallbackVoiceRow", otherSel: "studioOtherVoiceSelect", hint: "studioVoiceSimpleHint" },
+  ].forEach((cfg) => {
+    const pEl = document.getElementById(cfg.pills);
+    const rEl = document.getElementById(cfg.toneRow);
+    const cEl = document.getElementById(cfg.toneCards);
+    const fEl = document.getElementById(cfg.fbRow);
+    const oEl = document.getElementById(cfg.otherSel);
+    const hEl = document.getElementById(cfg.hint);
+    if (pEl) pEl.innerHTML = makeSpeakerPillsHtml();
+    if (activeVoice) {
+      rEl?.classList.remove("hidden");
+      fEl?.classList.add("hidden");
+      if (cEl) cEl.innerHTML = makeToneCardsHtml();
+      const toneMeta = activeTone ? getToneCardMeta(activeTone.key, activeTone.label) : { title: "自然主推" };
+      if (hEl) hEl.textContent = `当前已选：${activeVoice.display_name} · ${toneMeta.title}（点右侧「听样音」可先听再选，默认已开启深度去电音）`;
+    } else if (activeMode === "other") {
+      rEl?.classList.add("hidden");
+      fEl?.classList.remove("hidden");
+      if (oEl) {
+        oEl.innerHTML = otherOptsHtml || `<option value="">暂无已上传音色</option>`;
+        if (curVoiceVal && usableVoices.some((v) => String(v.id) === String(curVoiceVal))) oEl.value = String(curVoiceVal);
+      }
+      if (hEl) hEl.textContent = "已切换为其他参考音色，可在上方下拉挑选并点「试听原声」。";
+    } else {
+      rEl?.classList.add("hidden");
+      fEl?.classList.remove("hidden");
+      if (oEl) oEl.classList.add("hidden");
+      if (hEl) hEl.textContent = "已设为「跟随出镜形象原声」，点上方「试听原声」可听当前形象的声音。";
+    }
+    if (oEl && activeMode === "other") oEl.classList.remove("hidden");
+  });
+}
+
+function pickLocalSpeaker(voiceId) {
+  state.selectedPersonalVoiceId = voiceId || "auto";
+  const active = getActivePersonalVoice();
+  if (active) {
+    state.selectedPersonalPromptKey = String(active.default_prompt_key || active.prompts?.[0]?.key || "natural");
+    syncPersonalVoiceFromCreate(active.cfg_path || "");
+  } else {
+    state.selectedPersonalPromptKey = "";
+    syncPersonalVoiceFromCreate("");
+    if (voiceId === "auto") {
+      [document.getElementById("ttsVoiceSelect"), document.getElementById("voiceStudioVoiceSelect")].filter(Boolean).forEach((s) => (s.value = ""));
+    } else if (voiceId === "other") {
+      const firstV = state.voices.find((v) => v.exists);
+      if (firstV && !document.getElementById("ttsVoiceSelect")?.value) {
+        onOtherVoiceSelectChanged(String(firstV.id));
+      }
+    }
+  }
+  savePrefs({ personalVoiceId: state.selectedPersonalVoiceId, personalPromptKey: state.selectedPersonalPromptKey });
+  renderLocalVoicePickers();
+  updateVoicePreview();
+  updateVoiceStudioRefPreview();
+  updateWizardIndicators();
+}
+
+function pickLocalTone(voiceId, promptKey) {
+  state.selectedPersonalVoiceId = voiceId;
+  state.selectedPersonalPromptKey = promptKey;
+  const active = getActivePersonalVoice();
+  if (active) syncPersonalVoiceFromCreate(active.cfg_path || "");
+  savePrefs({ personalVoiceId: state.selectedPersonalVoiceId, personalPromptKey: state.selectedPersonalPromptKey });
+  renderLocalVoicePickers();
+  updateWizardIndicators();
+}
+
+function onOtherVoiceSelectChanged(val) {
+  state.preferredVoiceId = val || "";
+  savePrefs({ selectedVoiceId: state.preferredVoiceId });
+  ["ttsVoiceSelect", "voiceStudioVoiceSelect", "createOtherVoiceSelect", "studioOtherVoiceSelect"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && Array.from(el.options).some((o) => o.value === state.preferredVoiceId)) el.value = state.preferredVoiceId;
+  });
+  updateVoicePreview();
+  updateVoiceStudioRefPreview();
+  updateWizardIndicators();
+}
+
+async function refreshLocalStorageStats() {
+  try {
+    const st = await api("/api/v1/storage/stats");
+    const pol = st.policy || { auto_prune: true, max_age_days: 30, max_videos: 50, max_audios: 50 };
+    const aMeta = document.getElementById("localAudioStorageMeta");
+    if (aMeta) {
+      aMeta.textContent = `${st.audios?.total || 0} 条 · ${st.audios?.size_mb || 0} MB · 自动留 ${pol.max_age_days} 天 / ${pol.max_audios} 条`;
+    }
+    const lPill = document.getElementById("localLibraryStoragePill");
+    if (lPill) {
+      lPill.textContent = `本地成品 ${st.videos?.delivery_files || st.videos?.finished || 0} 个 · ${st.videos?.size_mb || 0} MB（留 ${pol.max_age_days} 天）`;
+    }
+  } catch {}
+}
+
+async function handleLocalStorageCleanup(scope) {
+  const label = scope === "all_audios"
+    ? "确认清空本地全部已合成的历史音频吗？（绝不影响底版原声与训练模型）"
+    : "按 30 天 / 50 条规则清理过期或超额的本地旧成品吗？（绝不动出镜形象和声音模型）";
+  if (!confirm(label)) return;
+  try {
+    const res = await api("/api/v1/storage/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope }),
+    });
+    const dv = res.deleted_videos || 0;
+    const da = res.deleted_audios || 0;
+    toast(dv + da > 0 ? `已清理 ${dv} 条视频、${da} 条音频，释放 ${res.freed_mb || 0} MB` : "当前本地成品均在保留范围内，无需清理", "success");
+    await Promise.all([refreshAll(true), refreshLocalStorageStats()]);
+  } catch (err) {
+    toast(`清理失败：${err.message}`, "error");
+  }
 }
 
 function collectTtsParams() {
@@ -1645,7 +1978,11 @@ function collectTtsParams() {
     chunk_size: Number(document.getElementById("ttsChunk").value),
     auto_fast_on_long_text: document.getElementById("ttsAutoFast").checked,
   };
-  if (chosenCfg) out.cfg_path = chosenCfg;
+  const activeVoice = getActivePersonalVoice();
+  const activeTone = getActivePersonalTone();
+  if (activeVoice?.cfg_path) out.cfg_path = activeVoice.cfg_path;
+  else if (chosenCfg) out.cfg_path = chosenCfg;
+  if (activeTone?.path) out.reference_audio = activeTone.path;
   return out;
 }
 
@@ -1811,9 +2148,9 @@ function getEffectiveVoiceId() {
 async function runTtsSynthesis({ source }) {
   const text = (document.getElementById(source === "voice" ? "voiceTextInput" : "ttsTextInput")?.value || "").trim();
   if (!text) return toast("请先输入口播文案", "warning");
-  const voiceId = getEffectiveVoiceId();
-  if (!voiceId) return toast("请先选择参考音色，或先选一位含原声的出镜形象", "warning");
   const ttsParams = collectTtsParams();
+  const voiceId = getEffectiveVoiceId();
+  if (!voiceId && !ttsParams.reference_audio) return toast("请先选择说话人物或参考音色", "warning");
   if (ttsParams.emo_mode === "emo_audio" && !ttsParams.emo_audio_prompt) {
     return toast("请先选择一段情感参考音频", "warning");
   }
@@ -1857,7 +2194,8 @@ async function runTtsSynthesis({ source }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
-        voice_id: voiceId,
+        voice_id: ttsParams.reference_audio ? null : voiceId,
+        reference_audio: ttsParams.reference_audio || null,
         tts_params: ttsParams,
         name: nameInput || null,
         category_id: catVal ? Number(catVal) : null,
@@ -1875,9 +2213,11 @@ async function runTtsSynthesis({ source }) {
     document.getElementById("ttsAuditionResult")?.classList.remove("hidden");
 
     const vTitle = document.getElementById("voiceLatestTitle");
+    const vPath = document.getElementById("voiceLatestPathHint");
     const vPlayer = document.getElementById("voiceLatestPlayer");
     const vDl = document.getElementById("voiceLatestDownload");
-    if (vTitle) vTitle.textContent = `最新合成：${item.name} (${fmtDuration(item.duration)})`;
+    if (vTitle) vTitle.textContent = `刚刚生成：${item.name} (${fmtDuration(item.duration)})`;
+    if (vPath) vPath.textContent = item.file_path ? `已保存至：${item.file_path}` : "已保存在本机音频库，随时可直接用于做视频";
     if (vPlayer) vPlayer.src = item.stream_url;
     if (vDl) vDl.href = item.download_url;
     document.getElementById("voiceLatestCard")?.classList.remove("hidden");
@@ -1916,41 +2256,180 @@ function formatAudioSourceLabel(sourceType) {
   return "网页上传";
 }
 
+function setVoiceSourceFilter(src) {
+  state.voiceSourceFilter = src || "all";
+  state.voiceVisibleLimit = 10;
+  document.querySelectorAll("#voiceSourceFilterTabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.asrc === state.voiceSourceFilter);
+  });
+  renderVoiceHistoryList();
+}
+
+function toggleVoiceBatchMode(forceVal) {
+  state.voiceBatchMode = typeof forceVal === "boolean" ? forceVal : !state.voiceBatchMode;
+  if (!state.voiceBatchMode) state.voiceBatchIds.clear();
+  const bar = document.getElementById("voiceBatchBar");
+  const btn = document.getElementById("btnVoiceBatchToggle");
+  bar?.classList.toggle("hidden", !state.voiceBatchMode);
+  if (btn) btn.textContent = state.voiceBatchMode ? "退出批量" : "批量管理";
+  renderVoiceHistoryList();
+}
+
+function toggleVoiceBatchItem(id, checked) {
+  if (checked) state.voiceBatchIds.add(id);
+  else state.voiceBatchIds.delete(id);
+  const cnt = document.getElementById("voiceBatchCount");
+  if (cnt) cnt.textContent = `已选 ${state.voiceBatchIds.size} 条`;
+}
+
+function getFilteredVoiceHistoryItems() {
+  const kw = (document.getElementById("voiceHistorySearch")?.value || "").trim().toLowerCase();
+  return state.audios.filter((a) => {
+    const isTts = a.source_type === "tts" || a.source_type === "indextts2";
+    if (state.voiceSourceFilter === "tts" && !isTts) return false;
+    if (state.voiceSourceFilter === "upload" && isTts) return false;
+    if (kw && !`${a.name} ${a.text_content}`.toLowerCase().includes(kw)) return false;
+    return true;
+  });
+}
+
+function toggleSelectAllVoiceBatch(checked) {
+  const items = getFilteredVoiceHistoryItems();
+  if (checked) items.forEach((a) => state.voiceBatchIds.add(a.id));
+  else items.forEach((a) => state.voiceBatchIds.delete(a.id));
+  renderVoiceHistoryList();
+}
+
+async function bulkDeleteSelectedAudios() {
+  const ids = Array.from(state.voiceBatchIds);
+  if (!ids.length) return toast("请先勾选要删除的音频", "warning");
+  if (!confirm(`确定删除选中的 ${ids.length} 条音频吗？（不会影响出镜形象和专属声音模型）`)) return;
+  try {
+    const res = await api("/api/v1/audios/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, remove_file: true }),
+    });
+    if (state.voiceBatchIds.has(state.voicePlayingAudioId)) closeVoiceSharedPlayer();
+    state.voiceBatchIds.clear();
+    toast(`已删除 ${res.deleted || ids.length} 条音频`, "success");
+    await Promise.all([refreshAll(true), refreshLocalStorageStats()]);
+  } catch (err) {
+    toast(`批量删除失败: ${err.message}`, "error");
+  }
+}
+
+function playAudioInSharedBar(audioId) {
+  const a = state.audios.find((x) => x.id === audioId);
+  if (!a || !a.stream_url) return toast("音频文件已缺失，无法播放", "warning");
+  const wrap = document.getElementById("voiceSharedPlayerWrap");
+  const titleEl = document.getElementById("voiceSharedPlayerTitle");
+  const player = document.getElementById("voiceSharedPlayer");
+  if (!wrap || !player) return;
+
+  if (state.voicePlayingAudioId === audioId && !player.paused) {
+    player.pause();
+    renderVoiceHistoryList();
+    return;
+  }
+
+  state.voicePlayingAudioId = audioId;
+  wrap.classList.remove("hidden");
+  if (titleEl) titleEl.textContent = `正在试听：${a.name}（${fmtDuration(a.duration)}）`;
+  if (player.getAttribute("src") !== a.stream_url) player.src = a.stream_url;
+  player.onended = () => renderVoiceHistoryList();
+  player.onpause = () => renderVoiceHistoryList();
+  player.onplay = () => renderVoiceHistoryList();
+  player.play().catch(() => {});
+  renderVoiceHistoryList();
+}
+
+function closeVoiceSharedPlayer() {
+  const wrap = document.getElementById("voiceSharedPlayerWrap");
+  const player = document.getElementById("voiceSharedPlayer");
+  if (player) {
+    player.pause();
+    player.removeAttribute("src");
+  }
+  wrap?.classList.add("hidden");
+  state.voicePlayingAudioId = null;
+  renderVoiceHistoryList();
+}
+
+function usePlayingAudioForVideo() {
+  if (!state.voicePlayingAudioId) return toast("请先点播一条音频", "warning");
+  quickVideoFromAudio(state.voicePlayingAudioId);
+}
+
+function loadMoreVoiceHistory() {
+  state.voiceVisibleLimit += 15;
+  renderVoiceHistoryList();
+}
+
 function renderVoiceHistoryList() {
   const wrap = document.getElementById("voiceHistoryList");
+  const moreWrap = document.getElementById("voiceHistoryMoreWrap");
   const badge = document.getElementById("voiceAudioCountBadge");
   if (!wrap) return;
   if (badge) badge.textContent = `${state.audios.length} 条`;
 
-  const kw = (document.getElementById("voiceHistorySearch")?.value || "").trim().toLowerCase();
-  const items = state.audios.filter((a) => !kw || `${a.name} ${a.text_content}`.toLowerCase().includes(kw));
+  const items = getFilteredVoiceHistoryItems();
+  const cntEl = document.getElementById("voiceBatchCount");
+  if (cntEl) cntEl.textContent = `已选 ${state.voiceBatchIds.size} 条`;
+  const selAllEl = document.getElementById("voiceBatchSelectAll");
+  if (selAllEl) selAllEl.checked = items.length > 0 && items.every((a) => state.voiceBatchIds.has(a.id));
 
   if (!items.length) {
-    wrap.innerHTML = `<div class="empty-box">暂无已合成或导入的音频</div>`;
+    wrap.innerHTML = `<div class="empty-box" style="padding:24px 10px;">暂无符合条件的音频</div>`;
+    moreWrap?.classList.add("hidden");
     return;
   }
 
+  const player = document.getElementById("voiceSharedPlayer");
+  const isAudioActuallyPlaying = Boolean(player && !player.paused && player.getAttribute("src"));
+  const visible = items.slice(0, state.voiceVisibleLimit);
   const local = isLocalBrowser();
-  wrap.innerHTML = items
-    .map(
-      (a) => `
-      <div class="list-row-item">
-        <div class="inline-row-between">
-          <strong style="font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;" title="${esc(a.name)}">${esc(a.name)}</strong>
-          <span class="state-tag st-muted">${formatAudioSourceLabel(a.source_type)} · ${fmtDuration(a.duration)}</span>
+
+  wrap.innerHTML = visible
+    .map((a) => {
+      const isPlaying = state.voicePlayingAudioId === a.id && isAudioActuallyPlaying;
+      const isActive = state.voicePlayingAudioId === a.id;
+      const checked = state.voiceBatchIds.has(a.id) ? "checked" : "";
+      const isTts = a.source_type === "tts" || a.source_type === "indextts2";
+      return `
+      <div class="audio-row-compact ${isActive ? "is-playing" : ""}">
+        ${state.voiceBatchMode ? `<input type="checkbox" ${checked} onchange="toggleVoiceBatchItem(${a.id}, this.checked)" aria-label="勾选音频" />` : ""}
+        <button type="button" class="audio-play-circle" title="${isPlaying ? "暂停" : "试听"}" onclick="playAudioInSharedBar(${a.id})">
+          ${isPlaying ? SVG_PAUSE : SVG_PLAY}
+        </button>
+        <div class="audio-row-main">
+          <div class="audio-row-top">
+            <span class="audio-row-name" title="${esc(a.name)}">${esc(a.name)}</span>
+            <span class="state-tag ${isTts ? "st-pending" : "st-muted"}">${formatAudioSourceLabel(a.source_type)}</span>
+            <span class="audio-row-meta">${fmtDuration(a.duration)}</span>
+          </div>
+          ${a.text_content ? `<div class="audio-row-snippet" title="${esc(a.text_content)}">${esc(a.text_content)}</div>` : `<div class="audio-row-snippet">${a.exists ? `${a.size_kb || 0} KB` : "音频文件已缺失"}</div>`}
         </div>
-        ${a.text_content ? `<div class="muted-text" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(a.text_content)}">${esc(a.text_content)}</div>` : ""}
-        ${a.stream_url ? `<audio src="${esc(a.stream_url)}" class="audio-player" controls></audio>` : `<div class="muted-text" style="color:var(--danger);">音频文件已缺失</div>`}
-        <div class="inline-row">
+        <div class="audio-row-actions">
           <button class="btn btn-xs btn-primary" onclick="quickVideoFromAudio(${a.id})">去做视频</button>
           ${a.download_url ? `<a class="btn btn-xs btn-secondary" href="${esc(a.download_url)}" download>下载</a>` : ""}
-          <button class="btn btn-xs btn-ghost" onclick="renameAudioAsset(${a.id})">改名</button>
           ${local ? `<button class="btn btn-xs btn-ghost" onclick="openAudioPath(${a.id})">定位</button>` : ""}
-          <button class="btn btn-xs btn-danger-ghost" onclick="deleteAudioAsset(${a.id})">删除</button>
+          <button class="btn btn-xs btn-danger-ghost" onclick="deleteAudioAsset(${a.id})">删</button>
         </div>
-      </div>`
-    )
+      </div>`;
+    })
     .join("");
+
+  if (moreWrap) {
+    const remain = items.length - visible.length;
+    if (remain > 0) {
+      moreWrap.classList.remove("hidden");
+      moreWrap.innerHTML = `<button class="btn btn-xs btn-secondary" type="button" onclick="loadMoreVoiceHistory()">展开更多（还有 ${remain} 条）</button>`;
+    } else {
+      moreWrap.classList.add("hidden");
+      moreWrap.innerHTML = "";
+    }
+  }
 }
 
 // ==================== 提交视频生成 ====================
@@ -2001,9 +2480,9 @@ async function handleSubmitTtsVideo() {
     document.getElementById("ttsTextInput")?.focus();
     return;
   }
-  const voiceId = getEffectiveVoiceId();
-  if (!voiceId) return toast("当前形象无原声，请先选择一个配音音色", "warning", 5000);
   const ttsParams = collectTtsParams();
+  const voiceId = getEffectiveVoiceId();
+  if (!voiceId && !ttsParams.reference_audio) return toast("当前形象无原声，请先选择一个说话人物或配音音色", "warning", 5000);
   if (ttsParams.emo_mode === "emo_audio" && !ttsParams.emo_audio_prompt) {
     return toast("请先前往「配声音」选择情感参考音频", "warning");
   }
@@ -2537,7 +3016,128 @@ async function openDeliveryFolder() {
 function setLibraryType(t) {
   state.libraryType = t;
   document.querySelectorAll("#libraryTypeTabs button").forEach((b) => b.classList.toggle("active", b.dataset.lib === t));
+  document.getElementById("librarySourceTabs")?.classList.toggle("hidden", t !== "videos");
   renderLibraryView();
+}
+
+function setLibrarySourceFilter(src) {
+  state.librarySourceFilter = src || "available";
+  document.querySelectorAll("#librarySourceTabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.lsrc === state.librarySourceFilter);
+  });
+  renderLibraryView();
+}
+
+function getSyncedLocalVideos() {
+  const raw = state.lastCloudSyncStatus?.synced_items || [];
+  return raw
+    .filter((it) => it && it.media_type !== "audio" && it.exists && it.sync_key)
+    .map((it) => {
+      const fname = (it.local_path || "").split(/[\\/]/).pop() || it.name || `云端作品_${it.video_id || ""}`;
+      const cleanTitle = (it.name || fname.replace(/\.[^.]+$/, "")).replace(/^云端成品_\d+_/, "");
+      const encKey = encodeURIComponent(it.sync_key);
+      return {
+        kind: "cloud_sync",
+        sync_key: it.sync_key,
+        id: `cs_${it.sync_key}`,
+        video_id: it.video_id || 0,
+        name: cleanTitle || fname,
+        file_name: fname,
+        local_path: it.local_path || "",
+        size_mb: Number(it.size_mb || 0),
+        savedMs: Math.round(Number(it.saved_at || 0) * 1000),
+        thumb_url: `/api/v1/cloud-sync/thumb/${encKey}`,
+        stream_url: `/api/v1/cloud-sync/media/${encKey}`,
+        meta: it.meta || "",
+      };
+    });
+}
+
+function getUnifiedPlayableVideos() {
+  const cloudVids = getSyncedLocalVideos();
+  const localVids = state.jobs
+    .filter((j) => j.status === "success" && j.file_exists)
+    .map((j) => ({
+      kind: "local_job",
+      id: j.id,
+      job: j,
+      name: j.name || `作品 #${j.id}`,
+      local_path: j.paths?.delivered_path || j.paths?.playable_path || "",
+      size_mb: Number(j.file_size_mb || 0),
+      duration: j.duration || 0,
+      savedMs: Number(j.created_at || 0),
+      thumb_url: j.thumb_url || "",
+      stream_url: j.stream_url || "",
+    }));
+  return [...cloudVids, ...localVids].sort((a, b) => (b.savedMs || 0) - (a.savedMs || 0));
+}
+
+function previewCloudSyncedVideo(syncKey) {
+  const item = getSyncedLocalVideos().find((x) => x.sync_key === syncKey);
+  if (!item) return toast("该视频文件已移动或不可用", "warning");
+  previewVideo(item.stream_url, `云端拉回：${item.name}`, item.local_path, item.thumb_url);
+}
+
+async function copyCloudSyncedFile(syncKey) {
+  try {
+    const res = await api(`/api/v1/cloud-sync/copy-file/${encodeURIComponent(syncKey)}`, { method: "POST" });
+    toast(res.message || "已复制视频文件，去微信或桌面粘贴即可", "success", 4000);
+  } catch (err) {
+    toast(`复制失败: ${err.message}`, "error");
+  }
+}
+
+function renderCreateRecentResults() {
+  const grid = document.getElementById("createRecentResultsGrid");
+  const badge = document.getElementById("createRecentCountBadge");
+  const dirPill = document.getElementById("createRecentDirPill");
+  if (!grid) return;
+
+  const saveDir = state.lastCloudSyncStatus?.save_dir || state.health?.paths?.delivery_root || "E:\\数字人视频文件";
+  if (dirPill) dirPill.textContent = `存放在：${saveDir}`;
+
+  const playable = getUnifiedPlayableVideos();
+  if (badge) badge.textContent = `${playable.length} 条可用`;
+
+  if (!playable.length) {
+    grid.innerHTML = `<div class="empty-box" style="padding:18px 10px;">还没有可播放的视频成品。上方点「开始生成视频」后，成品会直接显示在这里。</div>`;
+    return;
+  }
+
+  const local = isLocalBrowser();
+  grid.innerHTML = playable
+    .slice(0, 4)
+    .map((v) => {
+      const isCloud = v.kind === "cloud_sync";
+      const playClick = isCloud ? `previewCloudSyncedVideo('${escJs(v.sync_key)}')` : `previewJobVideo(${v.id})`;
+      const openClick = isCloud
+        ? `openCloudSyncFolder('${escJs(v.local_path)}')`
+        : `handleOpenJobFolder(${v.id})`;
+      const copyClick = isCloud
+        ? `copyCloudSyncedFile('${escJs(v.sync_key)}')`
+        : `handleCopyJobFile(${v.id})`;
+      return `
+        <div class="recent-result-card">
+          <div class="recent-result-thumb" onclick="${playClick}">
+            ${v.thumb_url ? `<img src="${esc(v.thumb_url)}" alt="${esc(v.name)}" loading="lazy" onerror="handleCoverImgError(this)" />` : `<div class="media-cover-placeholder">视频</div>`}
+            <div class="recent-result-play">${SVG_PLAY}</div>
+          </div>
+          <div class="recent-result-body">
+            <div class="inline-row" style="gap:6px;">
+              <span class="state-tag ${isCloud ? "st-pending" : "st-success"}">${isCloud ? "云端拉回" : "本机制作"}</span>
+              <span class="recent-result-meta">${fmtSizeMb(v.size_mb)}</span>
+            </div>
+            <div class="recent-result-title" title="${esc(v.name)}">${esc(v.name)}</div>
+            <div class="recent-result-meta">${v.savedMs ? fmtTime(v.savedMs) : ""}</div>
+            <div class="inline-row" style="gap:5px;margin-top:2px;">
+              <button class="btn btn-xs btn-primary" onclick="${playClick}">播放</button>
+              ${local ? `<button class="btn btn-xs btn-success" onclick="${copyClick}">复制文件</button>` : ""}
+              ${local ? `<button class="btn btn-xs btn-ghost" onclick="${openClick}">位置</button>` : ""}
+            </div>
+          </div>
+        </div>`;
+    })
+    .join("");
 }
 
 function selectCategory(catId) {
@@ -2642,9 +3242,14 @@ function renderLibraryView() {
 
   const isVid = state.libraryType === "videos";
   const allVideos = state.jobs.filter((j) => j.status === "success");
-  const totalCount = isVid ? allVideos.length : state.audios.length;
+  const srcFilterForCnt = state.librarySourceFilter || "available";
+  const cloudCnt = (srcFilterForCnt === "available" || srcFilterForCnt === "cloud" || srcFilterForCnt === "all") ? getSyncedLocalVideos().length : 0;
+  const scopedLocalVideos = (srcFilterForCnt === "cloud")
+    ? []
+    : allVideos.filter((j) => srcFilterForCnt === "all" || j.file_exists);
+  const totalCount = isVid ? (cloudCnt + scopedLocalVideos.length) : state.audios.length;
   const uncatCount = isVid
-    ? allVideos.filter((j) => !j.category_id).length
+    ? (cloudCnt + scopedLocalVideos.filter((j) => !j.category_id).length)
     : state.audios.filter((a) => !a.category_id).length;
 
   let catHtml = `
@@ -2652,7 +3257,7 @@ function renderLibraryView() {
     <button class="cat-pill ${state.selectedCategoryId === "uncategorized" ? "active" : ""}" onclick="selectCategory('uncategorized')">未分类 <span class="meta-num">${uncatCount}</span></button>`;
 
   state.categories.forEach((c) => {
-    const cnt = isVid ? allVideos.filter((j) => j.category_id === c.id).length : state.audios.filter((a) => a.category_id === c.id).length;
+    const cnt = isVid ? scopedLocalVideos.filter((j) => j.category_id === c.id).length : state.audios.filter((a) => a.category_id === c.id).length;
     catHtml += `
       <span class="cat-pill ${String(state.selectedCategoryId) === String(c.id) ? "active" : ""}" onclick="selectCategory('${c.id}')">
         <span>${esc(c.name)}</span>
@@ -2666,23 +3271,72 @@ function renderLibraryView() {
   const local = isLocalBrowser();
 
   if (isVid) {
-    const items = allVideos.filter((j) => {
+    const srcFilter = state.librarySourceFilter || "available";
+    const cloudVids = getSyncedLocalVideos().filter((cv) => {
+      if (state.selectedCategoryId !== "all" && state.selectedCategoryId !== "uncategorized") return false;
+      if (kw && !`${cv.name} ${cv.file_name} ${cv.meta}`.toLowerCase().includes(kw)) return false;
+      return true;
+    });
+    const localItems = allVideos.filter((j) => {
+      if (srcFilter !== "all" && !j.file_exists) return false;
       if (state.selectedCategoryId === "uncategorized" && j.category_id) return false;
       if (state.selectedCategoryId !== "all" && state.selectedCategoryId !== "uncategorized" && String(j.category_id) !== String(state.selectedCategoryId)) return false;
       if (kw && !`${j.name} ${j.text_content} ${j.model_name}`.toLowerCase().includes(kw)) return false;
       return true;
     });
 
-    if (!items.length) {
-      grid.innerHTML = `<div class="studio-pane empty-box" style="grid-column:1/-1;">当前分类下暂无视频作品</div>`;
+    const cards = [];
+    if (srcFilter === "available" || srcFilter === "cloud" || srcFilter === "all") {
+      cloudVids.forEach((cv) => cards.push({ kind: "cloud_sync", sortAt: cv.savedMs || 0, data: cv }));
+    }
+    if (srcFilter === "available" || srcFilter === "local" || srcFilter === "all") {
+      localItems.forEach((j) => cards.push({ kind: "local_job", sortAt: Number(j.created_at || 0), data: j }));
+    }
+    cards.sort((a, b) => b.sortAt - a.sortAt);
+
+    if (!cards.length) {
+      const deadCnt = allVideos.filter((j) => !j.file_exists).length;
+      const extraHint = srcFilter !== "all" && deadCnt > 0
+        ? `（另有 ${deadCnt} 条旧记录的原文件已移走，点上方「含已移走」可查看）`
+        : "";
+      grid.innerHTML = `<div class="studio-pane empty-box" style="grid-column:1/-1;">当前筛选下暂无可用视频作品${extraHint}</div>`;
       return;
     }
 
-    grid.innerHTML = items
-      .map((j) => {
+    grid.innerHTML = cards
+      .map((entry) => {
+        if (entry.kind === "cloud_sync") {
+          const cv = entry.data;
+          return `
+          <article class="media-item">
+            <div class="media-cover" onclick="previewCloudSyncedVideo('${escJs(cv.sync_key)}')">
+              <img src="${esc(cv.thumb_url)}" alt="${esc(cv.name)}" loading="lazy" onerror="handleCoverImgError(this)" />
+              <div class="play-overlay"><div class="play-circle">${SVG_PLAY}</div></div>
+              <div class="cover-pills">
+                <span class="cover-pill ok">云端拉回</span>
+                <span class="cover-pill">${fmtSizeMb(cv.size_mb)}</span>
+              </div>
+            </div>
+            <div class="media-body">
+              <div class="media-title-row">
+                <strong style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;" title="${esc(cv.name)}">${esc(cv.name)}</strong>
+              </div>
+              <div class="media-sub">自动拉回本机 · ${cv.savedMs ? fmtTime(cv.savedMs) : ""}</div>
+              <div class="media-path-hint" title="${esc(cv.local_path)}">存在：${esc(cv.local_path)}</div>
+              <div class="media-actions">
+                <button class="btn btn-xs btn-primary" onclick="previewCloudSyncedVideo('${escJs(cv.sync_key)}')">播放</button>
+                ${local ? `<button class="btn btn-xs btn-success" onclick="copyCloudSyncedFile('${escJs(cv.sync_key)}')">复制文件</button>` : ""}
+                ${local ? `<button class="btn btn-xs btn-secondary" onclick="openCloudSyncFolder('${escJs(cv.local_path)}')">打开位置</button>` : ""}
+                <a class="btn btn-xs btn-ghost" href="${esc(cv.stream_url)}" download="${esc(cv.file_name)}">另存</a>
+              </div>
+            </div>
+          </article>`;
+        }
+        const j = entry.data;
         const coverInner = j.thumb_url
           ? `<img src="${esc(j.thumb_url)}" alt="${esc(j.name)}" loading="lazy" onerror="handleCoverImgError(this)" />`
           : `<div class="media-cover-placeholder">暂无封面</div>`;
+        const savedPath = j.paths.delivered_path || j.paths.playable_path || "";
         return `
         <article class="media-item">
           <div class="media-cover" onclick="${j.file_exists ? `previewJobVideo(${j.id})` : ""}">
@@ -2698,7 +3352,8 @@ function renderLibraryView() {
               <button class="media-title-btn" title="点击直接改名" onclick="startInlineRenameJob(${j.id}, this.parentElement)">${esc(j.name)}</button>
               <button class="icon-btn" style="width:26px;height:26px;" title="重命名" onclick="startInlineRenameJob(${j.id}, this.parentElement)">${SVG_EDIT}</button>
             </div>
-            <div class="media-sub">形象：${esc(j.model_name || "-")} · ${fmtTime(j.created_at)}</div>
+            <div class="media-sub">本机制作 · 形象：${esc(j.model_name || "-")} · ${fmtTime(j.created_at)}</div>
+            <div class="media-path-hint" title="${esc(savedPath || "文件已移走")}">存在：${esc(savedPath || "文件已移走")}</div>
             <div class="inline-row-nowrap">
               <span class="muted-text" style="font-size:12px;flex-shrink:0;">分类</span>
               <select class="field-input field-sm" style="flex:1;" onchange="changeJobCategory(${j.id}, this.value)">
@@ -2706,13 +3361,6 @@ function renderLibraryView() {
                 ${state.categories.map((c) => `<option value="${c.id}" ${j.category_id === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
               </select>
             </div>
-            <details class="fold-panel" style="margin-bottom:0;">
-              <summary style="padding:6px 10px;font-size:12px;">文件位置与文案</summary>
-              <div class="fold-body" style="padding:8px 10px;font-size:12px;word-break:break-all;">
-                <div>成片：${esc(j.paths.delivered_path || j.paths.playable_path || "文件已移走")} <button class="btn-link" onclick="copyJobDeliveredPath(${j.id})">复制路径</button></div>
-                ${j.text_content ? `<div class="muted-text" style="margin-top:6px;font-size:12px;">文案：${esc(j.text_content)}</div>` : ""}
-              </div>
-            </details>
             <div class="media-actions">
               ${j.file_exists ? `<button class="btn btn-xs btn-primary" onclick="previewJobVideo(${j.id})">播放</button>` : ""}
               ${j.file_exists && local ? `<button class="btn btn-xs btn-success" onclick="handleCopyJobFile(${j.id})">复制文件</button>` : ""}
@@ -3587,6 +4235,9 @@ async function refreshCloudSyncStatus(fillInputs = false) {
       const evs = st.recent_events || [];
       logPre.textContent = evs.length ? evs.join("\n") : "暂无日志";
     }
+    updateNavCounters();
+    renderCreateRecentResults();
+    if (state.view === "library" && state.libraryType === "videos") renderLibraryView();
   } catch {}
 }
 
@@ -3669,6 +4320,7 @@ async function boot() {
 
   await refreshAll(true);
   refreshCloudSyncStatus(true);
+  refreshLocalStorageStats();
 
   try {
     const cfgRes = await api("/api/v1/tts/config");

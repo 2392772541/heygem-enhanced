@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>数字人一体化工作台 · 本机创作台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231d4ed8'/%3E%3Cpolygon points='25 19 46 32 25 45 25 19' fill='white'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/styles.css?v=20261125-light" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261126-ux4b" />
 </head>
 <body>
 <div class="app-shell">
@@ -155,50 +155,65 @@
                 <textarea class="field-textarea" id="ttsTextInput" rows="5" placeholder="粘贴或输入要让数字人说的话，支持长文案自动分段配音..." oninput="onScriptInputChanged()"></textarea>
               </div>
 
-              <div class="field-grid-2">
-                <div class="field" id="voiceBar">
-                  <div class="field-label-row">
-                    <label for="ttsVoiceSelect">配音音色</label>
-                    <div class="inline-row">
-                      <button class="btn-link" id="btnToggleVoicePreview" onclick="toggleVoicePreviewPlayer()">试听原声</button>
-                      <button class="btn-link" id="btnUploadVoiceQuick" onclick="openUploadVoiceModal()">上传音色</button>
-                    </div>
-                  </div>
-                  <select class="field-input" id="ttsVoiceSelect" onchange="onCreateVoiceSelectChanged()"></select>
+              <!-- 两步所听即所得选声卡片（先选人，再点样音对比 3 种语气） -->
+              <div class="voice-picker-card" id="createVoicePickerCard">
+                <div class="vp-row center">
+                  <span class="vp-label">谁来说话</span>
+                  <div class="vp-pills" id="createSpeakerPills"></div>
+                  <button class="btn btn-xs btn-ghost" id="btnUploadVoiceQuick" type="button" onclick="openUploadVoiceModal()">+ 上传新音色</button>
                 </div>
+                <div class="vp-row" id="createToneRow">
+                  <span class="vp-label">选语气</span>
+                  <div class="vp-tone-grid" id="createToneCards"></div>
+                </div>
+                <div class="vp-row center hidden" id="createFallbackVoiceRow">
+                  <span class="vp-label">参考音色</span>
+                  <div class="inline-row" style="flex:1;">
+                    <select class="field-input field-sm" id="createOtherVoiceSelect" style="max-width:260px;" onchange="onOtherVoiceSelectChanged(this.value)"></select>
+                    <button class="btn btn-xs btn-secondary" id="btnToggleVoicePreview" type="button" onclick="toggleVoicePreviewPlayer()">试听原声</button>
+                  </div>
+                </div>
+                <div class="vp-hint" id="createVoiceSimpleHint">点每个语气卡片右侧「听样音」可先听对比效果，选好直接写文案即可生成。</div>
+              </div>
 
-                <div class="field">
+              <div class="field-grid-2" style="margin-bottom:12px;">
+                <div class="field" style="margin-bottom:0;">
                   <label for="jobNameInput">作品名称（留空自动按内容命名）</label>
                   <input class="field-input" id="jobNameInput" name="local_work_title_no_autofill" autocomplete="off" data-lpignore="true" placeholder="留空自动取文案前10字加形象名" />
                 </div>
+                <div class="field" style="margin-bottom:0;">
+                  <div class="field-label-row">
+                    <label for="createSpeedRange">语速</label>
+                    <span id="createValSpeed" class="meta-num">1.00x</span>
+                  </div>
+                  <input type="range" id="createSpeedRange" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromCreate(this.value)" style="margin-top:8px;" />
+                </div>
+              </div>
+
+              <div class="hidden" id="voiceBar" aria-hidden="true">
+                <select class="field-input" id="ttsVoiceSelect" onchange="onCreateVoiceSelectChanged()"></select>
+                <select class="field-input field-sm" id="createPersonalVoiceSelect" onchange="syncPersonalVoiceFromCreate(this.value)">
+                  <option value="">按数字人绑定自动匹配</option>
+                </select>
               </div>
 
               <div id="voicePreviewWrap" class="hidden" style="margin-bottom:12px;">
                 <audio id="voiceRefPreview" class="audio-player" controls></audio>
               </div>
 
-              <div class="field-grid-2" style="margin-bottom:10px;">
-                <div class="field">
-                  <label for="createPersonalVoiceSelect">专属微调声音（已隐去官方公模）</label>
-                  <select class="field-input field-sm" id="createPersonalVoiceSelect" onchange="syncPersonalVoiceFromCreate(this.value)">
-                    <option value="">按数字人绑定自动匹配</option>
-                  </select>
-                </div>
-                <div class="field">
-                  <label for="createPostprocessMode">音质去电音（默认版本 B）</label>
-                  <select class="field-input field-sm" id="createPostprocessMode" onchange="syncPostprocessFromCreate(this.value)">
-                    <option value="fixB">版本 B · AI 深度去电音（默认推荐）</option>
-                    <option value="fixA">版本 A · 极速无损修音</option>
-                    <option value="off">关闭（原声直出）</option>
-                  </select>
-                </div>
-              </div>
-
               <!-- 折叠的高级配音与归类选项 -->
               <details class="fold-panel" id="createMoreOptions">
-                <summary>更多选项（语速、风格预设、情感模式与作品分类 · 当前：<span id="createTuneBadge">跟随原声 · 1.00x</span>）</summary>
+                <summary>专业微调（去电音、风格预设、情感模式与作品分类 · 当前：<span id="createTuneBadge">跟随原声 · 1.00x</span>）</summary>
                 <div class="fold-body">
-                  <div class="field-grid-2">
+                  <div class="field-grid-3">
+                    <div class="field">
+                      <label for="createPostprocessMode">音质去电音</label>
+                      <select class="field-input field-sm" id="createPostprocessMode" onchange="syncPostprocessFromCreate(this.value)">
+                        <option value="fixB">版本 B · AI 深度去电音（默认推荐）</option>
+                        <option value="fixA">版本 A · 极速无损修音</option>
+                        <option value="off">关闭（原声直出）</option>
+                      </select>
+                    </div>
                     <div class="field">
                       <label for="createPresetSelect">配音风格预设</label>
                       <select class="field-input field-sm" id="createPresetSelect" onchange="applyPresetById(this.value)"></select>
@@ -210,14 +225,6 @@
                       </div>
                       <select class="field-input field-sm" id="jobCategorySelect"></select>
                     </div>
-                  </div>
-
-                  <div class="field">
-                    <div class="field-label-row">
-                      <label for="createSpeedRange">语速</label>
-                      <span id="createValSpeed" class="meta-num">1.00x</span>
-                    </div>
-                    <input type="range" id="createSpeedRange" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromCreate(this.value)" />
                   </div>
 
                   <div class="field" style="margin-bottom:4px;">
@@ -303,7 +310,7 @@
 
             <!-- 底部操作栏 -->
             <div class="composer-footer">
-              <div class="ready-summary" id="wizardReadyHint">请先在左侧选择一位出镜形象</div>
+              <div class="ready-summary" id="wizardReadyHint">请先在上方选择一位出镜形象</div>
               <div class="inline-row" id="actionBtnsTts">
                 <button class="btn btn-secondary" id="btnSynthesizeTts" onclick="handleSynthesizeTts()">先试听配音</button>
                 <button class="btn btn-primary btn-lg" id="btnSubmitTtsVideo" onclick="handleSubmitTtsVideo()">开始生成视频</button>
@@ -313,21 +320,67 @@
               </div>
             </div>
           </div>
+
+          <!-- 底部：最近生成的成品直达区（解决做完找不到作品的痛点） -->
+          <div class="studio-pane" id="createRecentResultsPane">
+            <div class="pane-head">
+              <div class="inline-row" style="gap:10px;">
+                <h2>最近生成的成品 <span class="meta-num" id="createRecentCountBadge">0 条</span></h2>
+                <span class="storage-pill" id="createRecentDirPill">存放在：E:\数字人视频文件</span>
+              </div>
+              <div class="inline-row">
+                <button class="btn btn-xs btn-secondary" onclick="openCloudSyncFolder()">打开收片目录</button>
+                <button class="btn btn-xs btn-ghost" onclick="switchView('library')">查看全部作品</button>
+              </div>
+            </div>
+            <div class="recent-results-grid" id="createRecentResultsGrid">
+              <div class="empty-box" style="padding:18px 10px;">正在读取本机与云端拉回的成品...</div>
+            </div>
+          </div>
         </div>
       </section>
 
       <!-- ==================== 视图 2：配声音 ==================== -->
       <section class="view" id="view-voice">
         <div class="audio-split">
-          <!-- 左栏：配音参数与合成 -->
+          <!-- 左栏：简洁配音创作台（人名 → 3张可听语气卡 → 语速 → 文案） -->
           <div class="studio-pane">
             <div class="pane-head">
               <h2>合成配音</h2>
-              <div class="inline-row">
-                <select class="field-input field-sm" id="ttsPresetSelect" style="width:160px;" onchange="applySelectedPreset()"></select>
-                <button class="btn btn-xs btn-secondary" onclick="saveCurrentAsPreset()">存为预设</button>
-                <button class="btn btn-xs btn-ghost" onclick="saveAsGlobalTtsConfig()">设为默认</button>
-                <button class="btn btn-xs btn-danger-ghost" id="btnDeletePreset" onclick="deleteSelectedPreset()">删预设</button>
+              <span class="meta-num" id="ttsTuneSummary">语速 1.00x · 跟随原声</span>
+            </div>
+
+            <div class="voice-picker-card" id="studioVoicePickerCard">
+              <div class="vp-row center">
+                <span class="vp-label">谁来说话</span>
+                <div class="vp-pills" id="studioSpeakerPills"></div>
+                <button class="btn btn-xs btn-ghost" type="button" onclick="openUploadVoiceModal()">+ 上传新音色</button>
+              </div>
+              <div class="vp-row" id="studioToneRow">
+                <span class="vp-label">选语气</span>
+                <div class="vp-tone-grid" id="studioToneCards"></div>
+              </div>
+              <div class="vp-row center hidden" id="studioFallbackVoiceRow">
+                <span class="vp-label">参考音色</span>
+                <div class="inline-row" style="flex:1;">
+                  <select class="field-input field-sm" id="studioOtherVoiceSelect" style="max-width:260px;" onchange="onOtherVoiceSelectChanged(this.value)"></select>
+                  <button class="btn btn-xs btn-secondary" id="btnVoiceStudioPlayRef" type="button" onclick="toggleVoiceStudioRefPlayer()">试听原声</button>
+                </div>
+              </div>
+              <div class="vp-hint" id="studioVoiceSimpleHint">点每个语气卡片右侧「听样音」可先听效果再选，默认已开启深度去电音。</div>
+            </div>
+
+            <div class="field-grid-2" style="margin-bottom:12px;">
+              <div class="field" style="margin-bottom:0;">
+                <div class="field-label-row">
+                  <label for="ttsSpeed">语速</label>
+                  <span id="valSpeed" class="meta-num">1.00x</span>
+                </div>
+                <input type="range" id="ttsSpeed" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromVoiceStudio(this.value)" style="margin-top:8px;" />
+              </div>
+              <div class="field" style="margin-bottom:0;">
+                <label for="voiceAssetNameInput">音频名称（留空自动按文案命名）</label>
+                <input class="field-input" id="voiceAssetNameInput" name="voice_asset_title" autocomplete="off" placeholder="留空自动命名" />
               </div>
             </div>
 
@@ -336,125 +389,106 @@
                 <label for="voiceTextInput">配音文案（与「做视频」文案自动同步）</label>
                 <span id="voiceTextStats" class="meta-num">0 字 · 约 0 秒</span>
               </div>
-              <textarea class="field-textarea" id="voiceTextInput" rows="5" placeholder="输入要合成的口播文字..." oninput="onVoiceTextInputChanged()"></textarea>
+              <textarea class="field-textarea" id="voiceTextInput" rows="6" placeholder="输入要合成的口播文字..." oninput="onVoiceTextInputChanged()"></textarea>
             </div>
 
-            <div class="field-grid-2">
-              <div class="field">
-                <div class="field-label-row">
-                  <label for="voiceStudioVoiceSelect">参考音色</label>
-                  <div class="inline-row">
-                    <button class="btn-link" id="btnVoiceStudioPlayRef" onclick="toggleVoiceStudioRefPlayer()">试听原声</button>
-                    <button class="btn-link" onclick="openUploadVoiceModal()">上传音色</button>
-                  </div>
-                </div>
-                <select class="field-input" id="voiceStudioVoiceSelect" onchange="onVoiceStudioVoiceChanged()"></select>
-              </div>
-              <div class="field-grid-2" style="gap:8px;">
-                <div class="field">
-                  <label for="voiceAssetNameInput">音频名称</label>
-                  <input class="field-input" id="voiceAssetNameInput" name="voice_asset_title" autocomplete="off" placeholder="留空自动命名" />
-                </div>
-                <div class="field">
-                  <label for="voiceCategorySelect">归属分类</label>
-                  <select class="field-input" id="voiceCategorySelect"></select>
-                </div>
-              </div>
+            <div class="hidden" aria-hidden="true">
+              <select class="field-input" id="voiceStudioVoiceSelect" onchange="onVoiceStudioVoiceChanged()"></select>
+              <select class="field-input field-sm" id="ttsPersonalVoiceSelect" onchange="syncPersonalVoiceFromStudio(this.value)">
+                <option value="">按数字人绑定自动匹配</option>
+              </select>
             </div>
 
             <div id="voiceStudioRefWrap" class="hidden" style="margin-bottom:12px;">
               <audio id="voiceStudioRefPlayer" class="audio-player" controls></audio>
             </div>
 
-            <div class="field-grid-2" style="margin-bottom:10px;">
-              <div class="field">
-                <label for="ttsPersonalVoiceSelect">专属微调声音（已隐去官方公模）</label>
-                <select class="field-input field-sm" id="ttsPersonalVoiceSelect" onchange="syncPersonalVoiceFromStudio(this.value)">
-                  <option value="">按数字人绑定自动匹配</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="ttsPostprocessMode">音质去电音（默认版本 B）</label>
-                <select class="field-input field-sm" id="ttsPostprocessMode" onchange="syncPostprocessFromStudio(this.value)">
-                  <option value="fixB">版本 B · AI 深度去电音（默认推荐）</option>
-                  <option value="fixA">版本 A · 极速无损修音</option>
-                  <option value="off">关闭（原声直出）</option>
-                </select>
-              </div>
-            </div>
-
-            <div class="field-grid-3">
-              <div class="field">
-                <label for="ttsModelVersion">语音引擎版本</label>
-                <select class="field-input field-sm" id="ttsModelVersion" onchange="onTtsModelVersionChange()">
-                  <option value="IndexTTS-2">标准中文版（稳定）</option>
-                  <option value="IndexTTS-2.5">多语变速版（2.5）</option>
-                </select>
-              </div>
-              <div class="field" id="ttsLangField">
-                <label for="ttsLang">目标语言</label>
-                <select class="field-input field-sm" id="ttsLang" onchange="syncTuneSummaryAll()">
-                  <option value="ZH">中文</option>
-                  <option value="EN">英文</option>
-                  <option value="JA">日语</option>
-                  <option value="ES">西班牙语</option>
-                  <option value="AR">阿拉伯语</option>
-                </select>
-              </div>
-              <div class="field">
-                <div class="field-label-row">
-                  <label for="ttsSpeed">语速</label>
-                  <span id="valSpeed" class="meta-num">1.00x</span>
-                </div>
-                <input type="range" id="ttsSpeed" min="0.7" max="1.5" step="0.02" value="1.0" oninput="syncSpeedFromVoiceStudio(this.value)" />
-              </div>
-            </div>
-
-            <div class="field">
-              <div class="field-label-row">
-                <label>情感风格模式</label>
-                <span class="meta-num" id="ttsTuneSummary">语速 1.00x · 跟随原声</span>
-              </div>
-              <div class="seg-control" id="emoModeTabs">
-                <button class="seg-btn active" data-emo="same_as_speaker" onclick="setEmoMode('same_as_speaker')">跟随原声</button>
-                <button class="seg-btn" data-emo="emo_vector" onclick="setEmoMode('emo_vector')">8维情感滑块</button>
-                <button class="seg-btn" data-emo="emo_audio" onclick="setEmoMode('emo_audio')">参考音频</button>
-                <button class="seg-btn" data-emo="emo_text" onclick="setEmoMode('emo_text')">情绪描述词</button>
-              </div>
-            </div>
-
-            <div id="emoAlphaWrap" class="field hidden">
-              <div class="field-label-row">
-                <label for="ttsEmoAlpha">情感强度</label>
-                <span id="valEmoAlpha" class="meta-num">0.65</span>
-              </div>
-              <input type="range" id="ttsEmoAlpha" min="0" max="1" step="0.05" value="0.65" oninput="syncRangeVal('ttsEmoAlpha','valEmoAlpha','');syncTuneSummaryAll()" />
-            </div>
-
-            <div id="emoVectorBox" class="emo-grid hidden"></div>
-            <div id="emoSumHint" class="muted-text hidden" style="margin-bottom:10px;font-size:12px;"></div>
-
-            <div id="emoAudioBox" class="field hidden">
-              <label for="ttsEmoAudioPath">情感参考音频</label>
-              <div class="inline-row">
-                <input class="field-input field-sm" id="ttsEmoAudioPath" placeholder="选择或上传带目标情绪的一段人声" style="flex:1;" oninput="syncTuneSummaryAll()" />
-                <button class="btn btn-sm btn-secondary" id="btnPickEmoAudioLocal" onclick="pickEmoAudioFile()">选本机音频</button>
-                <label class="btn btn-sm btn-secondary upload-label">
-                  网页上传
-                  <input type="file" id="emoAudioFileInput" accept="audio/*" style="display:none;" onchange="uploadEmoAudio(this)" />
-                </label>
-              </div>
-            </div>
-
-            <div id="emoTextBox" class="field hidden">
-              <label for="ttsEmoText">情绪描述词</label>
-              <input class="field-input" id="ttsEmoText" placeholder="例如：真诚温和、语调轻快地介绍产品亮点" oninput="syncTuneSummaryAll()" />
-            </div>
-
-            <!-- 折叠的底层专业调音参数 -->
+            <!-- 折叠的专业调音参数（去电音、情感、预设、底层采样） -->
             <details class="fold-panel" id="voiceAdvDetails">
-              <summary>专业调音参数（扩散步数、语调随机度、停顿与分段）</summary>
+              <summary>专业微调（去电音、情感控制、预设、语种与底层采样）</summary>
               <div class="fold-body">
+                <div class="field-grid-3">
+                  <div class="field">
+                    <label for="ttsPostprocessMode">音质去电音</label>
+                    <select class="field-input field-sm" id="ttsPostprocessMode" onchange="syncPostprocessFromStudio(this.value)">
+                      <option value="fixB">版本 B · AI 深度去电音（默认推荐）</option>
+                      <option value="fixA">版本 A · 极速无损修音</option>
+                      <option value="off">关闭（原声直出）</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="ttsModelVersion">语音引擎版本</label>
+                    <select class="field-input field-sm" id="ttsModelVersion" onchange="onTtsModelVersionChange()">
+                      <option value="IndexTTS-2">标准中文版（稳定）</option>
+                      <option value="IndexTTS-2.5">多语变速版（2.5）</option>
+                    </select>
+                  </div>
+                  <div class="field" id="ttsLangField">
+                    <label for="ttsLang">目标语言</label>
+                    <select class="field-input field-sm" id="ttsLang" onchange="syncTuneSummaryAll()">
+                      <option value="ZH">中文</option>
+                      <option value="EN">英文</option>
+                      <option value="JA">日语</option>
+                      <option value="ES">西班牙语</option>
+                      <option value="AR">阿拉伯语</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="field-grid-2">
+                  <div class="field">
+                    <label for="voiceCategorySelect">归属分类</label>
+                    <select class="field-input field-sm" id="voiceCategorySelect"></select>
+                  </div>
+                  <div class="field">
+                    <label for="ttsPresetSelect">常用预设</label>
+                    <div class="inline-row">
+                      <select class="field-input field-sm" id="ttsPresetSelect" style="flex:1;" onchange="applySelectedPreset()"></select>
+                      <button class="btn btn-xs btn-secondary" type="button" onclick="saveCurrentAsPreset()">存预设</button>
+                      <button class="btn btn-xs btn-ghost" type="button" onclick="saveAsGlobalTtsConfig()">设默认</button>
+                      <button class="btn btn-xs btn-danger-ghost" id="btnDeletePreset" type="button" onclick="deleteSelectedPreset()">删</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label>情感风格模式</label>
+                  <div class="seg-control" id="emoModeTabs">
+                    <button class="seg-btn active" data-emo="same_as_speaker" onclick="setEmoMode('same_as_speaker')">跟随原声</button>
+                    <button class="seg-btn" data-emo="emo_vector" onclick="setEmoMode('emo_vector')">8维情感滑块</button>
+                    <button class="seg-btn" data-emo="emo_audio" onclick="setEmoMode('emo_audio')">参考音频</button>
+                    <button class="seg-btn" data-emo="emo_text" onclick="setEmoMode('emo_text')">情绪描述词</button>
+                  </div>
+                </div>
+
+                <div id="emoAlphaWrap" class="field hidden">
+                  <div class="field-label-row">
+                    <label for="ttsEmoAlpha">情感强度</label>
+                    <span id="valEmoAlpha" class="meta-num">0.65</span>
+                  </div>
+                  <input type="range" id="ttsEmoAlpha" min="0" max="1" step="0.05" value="0.65" oninput="syncRangeVal('ttsEmoAlpha','valEmoAlpha','');syncTuneSummaryAll()" />
+                </div>
+
+                <div id="emoVectorBox" class="emo-grid hidden"></div>
+                <div id="emoSumHint" class="muted-text hidden" style="margin-bottom:10px;font-size:12px;"></div>
+
+                <div id="emoAudioBox" class="field hidden">
+                  <label for="ttsEmoAudioPath">情感参考音频</label>
+                  <div class="inline-row">
+                    <input class="field-input field-sm" id="ttsEmoAudioPath" placeholder="选择或上传带目标情绪的一段人声" style="flex:1;" oninput="syncTuneSummaryAll()" />
+                    <button class="btn btn-sm btn-secondary" id="btnPickEmoAudioLocal" onclick="pickEmoAudioFile()">选本机音频</button>
+                    <label class="btn btn-sm btn-secondary upload-label">
+                      网页上传
+                      <input type="file" id="emoAudioFileInput" accept="audio/*" style="display:none;" onchange="uploadEmoAudio(this)" />
+                    </label>
+                  </div>
+                </div>
+
+                <div id="emoTextBox" class="field hidden">
+                  <label for="ttsEmoText">情绪描述词</label>
+                  <input class="field-input" id="ttsEmoText" placeholder="例如：真诚温和、语调轻快地介绍产品亮点" oninput="syncTuneSummaryAll()" />
+                </div>
+
                 <div class="adv-grid">
                   <div class="field">
                     <div class="field-label-row"><label for="ttsSteps">精细度步数</label><span id="valSteps" class="meta-num">25</span></div>
@@ -512,15 +546,25 @@
             </div>
           </div>
 
-          <!-- 右栏：已合成音频库 -->
+          <!-- 右栏：固定高度可筛选音频管理器（单置顶播放器 + 批量管理） -->
           <div class="studio-pane">
             <div class="pane-head">
-              <h2>已合成音频 <span class="meta-num" id="voiceAudioCountBadge">0</span></h2>
-              <input class="field-input field-sm" id="voiceHistorySearch" style="width:160px;" placeholder="搜索音频..." autocomplete="off" oninput="renderVoiceHistoryList()" />
+              <div>
+                <h2>已配好的声音 <span class="meta-num" id="voiceAudioCountBadge">0</span></h2>
+                <div class="muted-text" id="localAudioStorageMeta" style="font-size:12px;margin-top:2px;">自动保留 30 天 / 最多 50 条</div>
+              </div>
+              <div class="inline-row">
+                <button class="btn btn-xs btn-secondary" id="btnVoiceBatchToggle" type="button" onclick="toggleVoiceBatchMode()">批量管理</button>
+                <button class="btn btn-xs btn-ghost" type="button" onclick="handleLocalStorageCleanup('all_audios')">清理旧音频</button>
+              </div>
             </div>
 
             <div id="voiceLatestCard" class="inline-status-box ok hidden">
-              <strong style="font-size:13px;" id="voiceLatestTitle">最新合成音频</strong>
+              <div class="inline-row-between">
+                <strong style="font-size:13px;" id="voiceLatestTitle">刚刚生成的配音</strong>
+                <span class="state-tag st-success">最新</span>
+              </div>
+              <div class="muted-text" id="voiceLatestPathHint" style="font-size:12px;">已保存在本机音频库，随时可直接用于做视频</div>
               <audio id="voiceLatestPlayer" class="audio-player" controls></audio>
               <div class="inline-row">
                 <button class="btn btn-xs btn-primary" onclick="useLatestVoiceAssetForVideo()">用这段音频做视频</button>
@@ -528,7 +572,41 @@
               </div>
             </div>
 
-            <div id="voiceHistoryList" class="list-rows"></div>
+            <!-- 单一共享置顶播放器（点列表任意一条即在此试听，不再刷满屏幕播放器） -->
+            <div id="voiceSharedPlayerWrap" class="audio-shared-player hidden">
+              <div class="audio-shared-player-head">
+                <span class="audio-shared-player-title" id="voiceSharedPlayerTitle">正在试听</span>
+                <div class="inline-row">
+                  <button class="btn btn-xs btn-primary" type="button" onclick="usePlayingAudioForVideo()">去做视频</button>
+                  <button class="btn btn-xs btn-ghost" type="button" onclick="closeVoiceSharedPlayer()">关闭</button>
+                </div>
+              </div>
+              <audio id="voiceSharedPlayer" class="audio-player" controls style="margin:0;"></audio>
+            </div>
+
+            <div class="audio-mgr-toolbar">
+              <div class="seg-control" id="voiceSourceFilterTabs">
+                <button class="seg-btn active" style="padding:3px 10px;font-size:12px;" data-asrc="all" onclick="setVoiceSourceFilter('all')">全部</button>
+                <button class="seg-btn" style="padding:3px 10px;font-size:12px;" data-asrc="tts" onclick="setVoiceSourceFilter('tts')">配音生成</button>
+                <button class="seg-btn" style="padding:3px 10px;font-size:12px;" data-asrc="upload" onclick="setVoiceSourceFilter('upload')">本地上传</button>
+              </div>
+              <input class="field-input field-sm" id="voiceHistorySearch" style="width:146px;" placeholder="搜索名称或文案..." autocomplete="off" oninput="renderVoiceHistoryList()" />
+            </div>
+
+            <div id="voiceBatchBar" class="audio-batch-bar hidden">
+              <label class="check-item" style="font-size:12.5px;">
+                <input type="checkbox" id="voiceBatchSelectAll" onchange="toggleSelectAllVoiceBatch(this.checked)" />
+                <span>全选当前</span>
+              </label>
+              <div class="inline-row">
+                <span class="meta-num" id="voiceBatchCount">已选 0 条</span>
+                <button class="btn btn-xs btn-danger" id="btnVoiceBulkDelete" type="button" onclick="bulkDeleteSelectedAudios()">删除所选</button>
+                <button class="btn btn-xs btn-ghost" type="button" onclick="toggleVoiceBatchMode(false)">完成</button>
+              </div>
+            </div>
+
+            <div id="voiceHistoryList" class="audio-manager-list"></div>
+            <div id="voiceHistoryMoreWrap" class="audio-more-wrap hidden"></div>
           </div>
         </div>
       </section>
@@ -564,6 +642,8 @@
               <span class="cloud-sync-status-text" id="cloudSyncConnText">正在读取同步状态...</span>
             </div>
             <div class="inline-row">
+              <span class="storage-pill" id="localLibraryStoragePill">自动保留 30 天 / 50 条</span>
+              <button class="btn btn-xs btn-secondary" type="button" onclick="handleLocalStorageCleanup('expired')">清理旧成品</button>
               <button class="btn btn-xs btn-secondary" id="btnCloudSyncNow" onclick="triggerCloudSyncNow()">立即检测</button>
               <button class="btn btn-xs btn-secondary" onclick="openCloudSyncFolder()">打开收片目录</button>
               <button class="btn btn-xs btn-ghost" id="btnToggleCloudSyncDrawer" onclick="toggleCloudSyncDrawer()">
@@ -659,12 +739,20 @@
 
         <!-- 作品筛选栏 -->
         <div class="view-toolbar">
-          <div class="seg-control" id="libraryTypeTabs">
-            <button class="seg-btn active" data-lib="videos" onclick="setLibraryType('videos')">视频作品</button>
-            <button class="seg-btn" data-lib="audios" onclick="setLibraryType('audios')">音频素材</button>
+          <div class="inline-row" style="gap:10px;">
+            <div class="seg-control" id="libraryTypeTabs">
+              <button class="seg-btn active" data-lib="videos" onclick="setLibraryType('videos')">视频作品</button>
+              <button class="seg-btn" data-lib="audios" onclick="setLibraryType('audios')">音频素材</button>
+            </div>
+            <div class="seg-control" id="librarySourceTabs">
+              <button class="seg-btn active" data-lsrc="available" onclick="setLibrarySourceFilter('available')">全部可用</button>
+              <button class="seg-btn" data-lsrc="cloud" onclick="setLibrarySourceFilter('cloud')">云端拉回</button>
+              <button class="seg-btn" data-lsrc="local" onclick="setLibrarySourceFilter('local')">本机制作</button>
+              <button class="seg-btn" data-lsrc="all" onclick="setLibrarySourceFilter('all')">含已移走</button>
+            </div>
           </div>
           <div class="inline-row">
-            <input class="field-input field-sm" id="libSearch" style="width:220px;" placeholder="搜索标题、形象或文案..." autocomplete="off" oninput="renderLibraryView()" />
+            <input class="field-input field-sm" id="libSearch" style="width:200px;" placeholder="搜索标题、形象或文案..." autocomplete="off" oninput="renderLibraryView()" />
             <button class="btn btn-sm btn-secondary" onclick="promptNewCategory()">+ 新建分类</button>
             <button class="btn btn-sm btn-secondary" id="btnOpenDeliveryFolder" onclick="openDeliveryFolder()">打开本机成片目录</button>
           </div>
@@ -955,6 +1043,6 @@ GET  /api/v1/jobs/{id}/download 下载成片</div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
-<script src="/static/app.js?v=20261126-audio"></script>
+<script src="/static/app.js?v=20261126-ux4b"></script>
 </body>
 </html>

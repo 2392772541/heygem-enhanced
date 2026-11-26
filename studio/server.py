@@ -101,8 +101,9 @@ def _proxy_tts_json(method: str, path: str, payload: dict[str, Any] | None = Non
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -554,6 +555,11 @@ class JobUpdateRequest(BaseModel):
 class AudioUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     category_id: int | None = None
+
+
+class BulkAudioDeleteRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1)
+    remove_file: bool = True
 
 
 class LocalAudioImportRequest(BaseModel):
@@ -1408,6 +1414,20 @@ def _load_registered_personal_voices() -> list[dict[str, Any]]:
         if not cfg_p or not Path(cfg_p).is_file() or not gpt_p or not Path(gpt_p).is_file():
             continue
         m_label = str(m_entry.get("label") or def_mk).strip()
+        prompt_list: list[dict[str, str]] = []
+        for pk, pmeta in prompts.items():
+            if not isinstance(pmeta, dict):
+                continue
+            pp = str(pmeta.get("path") or "").strip()
+            if pp and Path(pp).is_file():
+                prompt_list.append(
+                    {
+                        "key": str(pk),
+                        "label": str(pmeta.get("label") or pk).strip(),
+                        "path": pp.replace("\\", "/"),
+                        "sample_url": f"/api/v1/tts/registered-voice-sample/{quote(vid)}/{quote(str(pk))}",
+                    }
+                )
         out.append(
             {
                 "voice_id": vid,
@@ -1416,6 +1436,8 @@ def _load_registered_personal_voices() -> list[dict[str, Any]]:
                 "label": f"{dname} · {m_label}",
                 "cfg_path": cfg_p.replace("\\", "/"),
                 "prompt_path": def_prompt_path.replace("\\", "/"),
+                "default_prompt_key": def_pk,
+                "prompts": prompt_list,
             }
         )
     return out
@@ -1553,10 +1575,33 @@ def _merge_preset_and_params(preset_id: int | None, override_params: dict[str, A
         conn.close()
 
 
+@app.get("/api/v1/tts/registered-voice-sample/{voice_id}/{prompt_key}", tags=["IndexTTS2 语音工作台"])
+def api_registered_voice_sample(voice_id: str, prompt_key: str) -> FileResponse:
+    """直放已注册专属声音的参考样音（自然/温和/干净），支持前端一键试听对比。"""
+    for v in _load_registered_personal_voices():
+        if str(v.get("voice_id") or "") != voice_id:
+            continue
+        for p in v.get("prompts") or []:
+            if str(p.get("key") or "") == prompt_key:
+                target = Path(str(p.get("path") or ""))
+                if target.is_file():
+                    return FileResponse(
+                        path=str(target),
+                        media_type="audio/wav",
+                        headers={"Cache-Control": "public, max-age=3600"},
+                    )
+    raise HTTPException(status_code=404, detail="未找到该专属声音的参考样音文件")
+
+
 @app.post("/api/v1/tts/synthesize", tags=["IndexTTS2 语音工作台"], dependencies=[Depends(_verify_api_key)])
 def api_tts_synthesize(req: TtsSynthesizeRequest) -> dict[str, Any]:
     """使用 IndexTTS2 实时合成试听音频，自动保存入音频素材库并可直接用于驱动数字人。"""
+    effective_params = _merge_preset_and_params(req.preset_id, req.tts_params)
     ref_audio = clean_local_path(req.reference_audio)
+    if not ref_audio:
+        param_ref = clean_local_path(str(effective_params.get("reference_audio") or ""))
+        if param_ref and Path(param_ref).is_file():
+            ref_audio = param_ref.replace("\\", "/")
     if not ref_audio and req.voice_id:
         conn = get_conn()
         try:
@@ -1573,7 +1618,6 @@ def api_tts_synthesize(req: TtsSynthesizeRequest) -> dict[str, Any]:
     if not ref_audio:
         raise HTTPException(status_code=400, detail="请先选择一个音色或参考音频")
 
-    effective_params = _merge_preset_and_params(req.preset_id, req.tts_params)
     invoke_payload = {
         "text": req.text.strip(),
         "reference_audio": ref_audio,
@@ -1865,6 +1909,31 @@ def api_update_audio(audio_id: int, req: AudioUpdateRequest) -> dict[str, Any]:
         conn.close()
 
 
+@app.post("/api/v1/audios/bulk-delete", tags=["音频素材库"], dependencies=[Depends(_verify_api_key)])
+def api_bulk_delete_audios(req: BulkAudioDeleteRequest) -> dict[str, Any]:
+    """批量删除历史音频记录与对应 WAV 文件（绝不影响参考音色与声音模型）。"""
+    clean_ids = sorted({int(x) for x in req.ids if int(x) > 0})
+    if not clean_ids:
+        raise HTTPException(status_code=400, detail="请至少选择 1 条要删除的音频")
+    deleted = 0
+    conn = get_conn()
+    try:
+        placeholders = ",".join("?" for _ in clean_ids)
+        rows = conn.execute(f"SELECT id, file_path FROM studio_audio_assets WHERE id IN ({placeholders})", clean_ids).fetchall()
+        for r in rows:
+            if req.remove_file and r["file_path"]:
+                try:
+                    Path(r["file_path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            deleted += 1
+        conn.execute(f"DELETE FROM studio_audio_assets WHERE id IN ({placeholders})", clean_ids)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "deleted": deleted}
+
+
 @app.delete("/api/v1/audios/{audio_id}", tags=["音频素材库"], dependencies=[Depends(_verify_api_key)])
 def api_delete_audio(audio_id: int, remove_file: bool = True) -> dict[str, Any]:
     conn = get_conn()
@@ -1973,18 +2042,23 @@ def _validate_and_prepare_job_spec(conn, item: JobCreateItem, index: int | None 
         if not text_content:
             raise HTTPException(status_code=400, detail=f"{prefix}请提供口播文案 text，或提供 audio_asset_id / audio_path")
 
-        # 文本配音模式前置校验：参考音色记录与本地音色文件必须真实存在
-        if not voice_id:
-            raise HTTPException(status_code=400, detail=f"{prefix}数字人模特「{model['name']}」未绑定默认音色，请指定 voice_id")
-        vrow = conn.execute("SELECT * FROM voice WHERE id=?", (voice_id,)).fetchone()
-        if not vrow:
-            raise HTTPException(status_code=404, detail=f"{prefix}参考音色 ID={voice_id} 不存在")
-        voice_file = _resolve_voice_file(dict(vrow))
-        if not voice_file or not voice_file.is_file():
-            raise HTTPException(
-                status_code=400,
-                detail=f"{prefix}参考音色 ID={voice_id} 的音频文件缺失：{voice_file or '(未配置)'}，请先在「人物与声音」页面检查或重新上传声音",
-            )
+        # 文本配音模式前置校验：若显式指定了存在的专属语气参考音（reference_audio），允许无默认原声的形象直接提交
+        custom_ref_raw = clean_local_path(str(effective_tts_params.get("reference_audio") or ""))
+        has_custom_ref = bool(custom_ref_raw and Path(custom_ref_raw).is_file())
+        if has_custom_ref:
+            effective_tts_params["reference_audio"] = str(Path(custom_ref_raw)).replace("\\", "/")
+        else:
+            if not voice_id:
+                raise HTTPException(status_code=400, detail=f"{prefix}数字人模特「{model['name']}」未绑定默认音色，请指定 voice_id")
+            vrow = conn.execute("SELECT * FROM voice WHERE id=?", (voice_id,)).fetchone()
+            if not vrow:
+                raise HTTPException(status_code=404, detail=f"{prefix}参考音色 ID={voice_id} 不存在")
+            voice_file = _resolve_voice_file(dict(vrow))
+            if not voice_file or not voice_file.is_file():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{prefix}参考音色 ID={voice_id} 的音频文件缺失：{voice_file or '(未配置)'}，请先在「人物与声音」页面检查或重新上传声音",
+                )
 
         # 情感音频模式前置校验：若请求未显式传 emo_mode，同步参考全局 adapter/config.json 默认值
         adapter_cfg = _load_adapter_config_fallback()
@@ -2413,6 +2487,230 @@ def api_delete_job(job_id: int, remove_files: bool = False) -> dict[str, Any]:
     return {"ok": True}
 
 
+# ==================== 本地成品防堆积（默认 30 天 / 50 条） ====================
+
+_LOCAL_RETENTION_DEFAULT: dict[str, Any] = {
+    "auto_prune": True,
+    "max_age_days": 30,
+    "max_videos": 50,
+    "max_audios": 50,
+}
+_LOCAL_LAST_PRUNE_TS: list[float] = [0.0]
+
+
+def _local_retention_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "studio_retention.json"
+
+
+def _load_local_retention() -> dict[str, Any]:
+    cfg = dict(_LOCAL_RETENTION_DEFAULT)
+    p = _local_retention_path()
+    if p.is_file():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict):
+                cfg["auto_prune"] = bool(raw.get("auto_prune", True))
+                cfg["max_age_days"] = max(1, min(365, int(raw.get("max_age_days", 30))))
+                cfg["max_videos"] = max(1, min(500, int(raw.get("max_videos", 50))))
+                cfg["max_audios"] = max(1, min(500, int(raw.get("max_audios", 50))))
+        except Exception:
+            pass
+    return cfg
+
+
+def _save_local_retention(patch: dict[str, Any]) -> dict[str, Any]:
+    cfg = _load_local_retention()
+    if "auto_prune" in patch:
+        cfg["auto_prune"] = bool(patch["auto_prune"])
+    if "max_age_days" in patch:
+        cfg["max_age_days"] = max(1, min(365, int(patch["max_age_days"])))
+    if "max_videos" in patch:
+        cfg["max_videos"] = max(1, min(500, int(patch["max_videos"])))
+    if "max_audios" in patch:
+        cfg["max_audios"] = max(1, min(500, int(patch["max_audios"])))
+    p = _local_retention_path()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+    return cfg
+
+
+def _ts_epoch(raw: Any) -> float:
+    try:
+        v = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v / 1000.0 if v > 1e12 else v
+
+
+def _local_storage_stats() -> dict[str, Any]:
+    cfg = _load_local_retention()
+    conn = get_conn()
+    try:
+        v_rows = conn.execute(
+            """
+            SELECT v.id, v.status, v.created_at, jm.delivered_path
+            FROM video v
+            LEFT JOIN studio_job_meta jm ON jm.video_id = v.id
+            ORDER BY v.id DESC
+            """
+        ).fetchall()
+        a_rows = conn.execute("SELECT id, file_path, created_at FROM studio_audio_assets ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+
+    finished_v = 0
+    v_bytes = 0
+    for r in v_rows:
+        if str(r["status"] or "").lower() not in ("waiting", "pending", "running"):
+            finished_v += 1
+            dp = str(r["delivered_path"] or "").strip()
+            if dp and Path(dp).is_file():
+                try:
+                    v_bytes += Path(dp).stat().st_size
+                except OSError:
+                    pass
+    a_bytes = 0
+    for r in a_rows:
+        fp = str(r["file_path"] or "").strip()
+        if fp and Path(fp).is_file():
+            try:
+                a_bytes += Path(fp).stat().st_size
+            except OSError:
+                pass
+    # 也统计交付目录中的真实 MP4 体积（含云端拉回成片）
+    deliv_dir = resolve_delivery_root()
+    deliv_files = 0
+    deliv_bytes = 0
+    if deliv_dir.is_dir():
+        for f in deliv_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in (".mp4", ".mov", ".mkv"):
+                deliv_files += 1
+                try:
+                    deliv_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    return {
+        "policy": cfg,
+        "videos": {"finished": finished_v, "delivery_files": deliv_files, "size_mb": round(max(v_bytes, deliv_bytes) / (1024 * 1024), 1)},
+        "audios": {"total": len(a_rows), "size_mb": round(a_bytes / (1024 * 1024), 2)},
+    }
+
+
+def _prune_local_outputs(scope: str = "expired") -> dict[str, Any]:
+    """按 30 天 / 50 条规则或用户指定范围清理本地已完成成品，严禁触碰底版视频与参考音色。"""
+    cfg = _load_local_retention()
+    cutoff = time.time() - float(cfg["max_age_days"]) * 86400.0
+    del_v = 0
+    del_a = 0
+    freed = 0
+
+    conn = get_conn()
+    try:
+        protected_names = {
+            Path(str(r[0] or "").replace("\\", "/")).name.lower()
+            for r in conn.execute("SELECT video_path FROM f2f_model").fetchall()
+            if r[0]
+        }
+        audio_root = (resolve_studio_assets_root() / "audio").resolve()
+
+        if scope in ("expired", "all_videos", "all"):
+            v_rows = conn.execute(
+                """
+                SELECT v.id, v.status, v.created_at, jm.delivered_path
+                FROM video v
+                LEFT JOIN studio_job_meta jm ON jm.video_id = v.id
+                ORDER BY v.id DESC
+                """
+            ).fetchall()
+            done_rows = [r for r in v_rows if str(r["status"] or "").lower() not in ("waiting", "pending", "running")]
+            for idx, r in enumerate(done_rows):
+                ts = _ts_epoch(r["created_at"])
+                if scope in ("all_videos", "all") or idx >= int(cfg["max_videos"]) or (ts > 0 and ts < cutoff):
+                    vid = int(r["id"])
+                    dp = str(r["delivered_path"] or "").strip()
+                    if dp and Path(dp).is_file() and Path(dp).name.lower() not in protected_names:
+                        try:
+                            freed += Path(dp).stat().st_size
+                            Path(dp).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    conn.execute("DELETE FROM studio_job_meta WHERE video_id=?", (vid,))
+                    conn.execute("DELETE FROM studio_cancel_requests WHERE video_id=?", (vid,))
+                    conn.execute("DELETE FROM video WHERE id=?", (vid,))
+                    _remove_video_thumbnail(vid)
+                    _remove_compact_cache(vid)
+                    del_v += 1
+
+        if scope in ("expired", "all_audios", "all"):
+            a_rows = conn.execute("SELECT id, file_path, created_at FROM studio_audio_assets ORDER BY id DESC").fetchall()
+            for idx, r in enumerate(a_rows):
+                ts = _ts_epoch(r["created_at"])
+                if scope in ("all_audios", "all") or idx >= int(cfg["max_audios"]) or (ts > 0 and ts < cutoff):
+                    aid = int(r["id"])
+                    fp = str(r["file_path"] or "").strip()
+                    if fp and Path(fp).is_file():
+                        try:
+                            rp = Path(fp).resolve()
+                            if rp.parent == audio_root or audio_root in rp.parents:
+                                freed += rp.stat().st_size
+                                rp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    conn.execute("DELETE FROM studio_audio_assets WHERE id=?", (aid,))
+                    del_a += 1
+
+        if del_v or del_a:
+            conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "scope": scope,
+        "deleted_videos": del_v,
+        "deleted_audios": del_a,
+        "freed_mb": round(freed / (1024 * 1024), 2),
+        "stats": _local_storage_stats(),
+    }
+
+
+def _maybe_auto_prune_local() -> None:
+    if os.getenv("HEYGEM_DISABLE_AUTO_PRUNE") == "1" or os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    now = time.time()
+    if now - _LOCAL_LAST_PRUNE_TS[0] < 600.0:
+        return
+    cfg = _load_local_retention()
+    if not cfg.get("auto_prune", True):
+        return
+    _LOCAL_LAST_PRUNE_TS[0] = now
+    try:
+        _prune_local_outputs("expired")
+    except Exception:
+        pass
+
+
+@app.get("/api/v1/storage/stats", tags=["空间管理"], dependencies=[Depends(_verify_api_key)])
+def api_local_storage_stats() -> dict[str, Any]:
+    _maybe_auto_prune_local()
+    return _local_storage_stats()
+
+
+@app.put("/api/v1/storage/retention", tags=["空间管理"], dependencies=[Depends(_verify_api_key)])
+def api_local_update_retention(payload: dict[str, Any]) -> dict[str, Any]:
+    cfg = _save_local_retention(payload or {})
+    return {"ok": True, "policy": cfg, "stats": _local_storage_stats()}
+
+
+@app.post("/api/v1/storage/cleanup", tags=["空间管理"], dependencies=[Depends(_verify_api_key)])
+def api_local_storage_cleanup(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    scope = str((payload or {}).get("scope") or "expired").strip()
+    if scope not in ("expired", "all_audios", "all_videos", "all"):
+        raise HTTPException(status_code=400, detail=f"不支持的清理范围: {scope}")
+    return _prune_local_outputs(scope)
+
+
 class FastFileResponse(FileResponse):
     """使用 4MB 大块传输替代默认的 64KB 小块，大幅减少大视频下载时的线程切换开销，同时完整保留 HTTP Range 断点续传。"""
 
@@ -2829,6 +3127,54 @@ def manual_pull_cloud_audio(audio_id: int) -> dict[str, Any]:
 
     threading.Thread(target=_run, name=f"CloudSyncPullAudio-{audio_id}", daemon=True).start()
     return {"ok": True, "message": f"已开始拉回云端 #{audio_id} 号配音音频"}
+
+
+def _resolve_cloud_synced_file(sync_key: str) -> tuple[Path, dict[str, Any]]:
+    """根据 sync_key 安全定位已拉回本地的云端成品文件（仅允许已登记在册的文件）。"""
+    item = cloud_sync_manager.get_synced_item(sync_key)
+    if not item:
+        raise HTTPException(status_code=404, detail="未找到对应的云端拉回记录")
+    target = Path(str(item.get("local_path") or ""))
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="该本地文件已被移动或删除")
+    return target, item
+
+
+@app.get("/api/v1/cloud-sync/media/{sync_key:path}", tags=["云端自动同步"])
+def stream_cloud_synced_media(sync_key: str) -> FileResponse:
+    """直放已拉回本地的云端视频/音频文件（支持进度条拖拽）。"""
+    target, item = _resolve_cloud_synced_file(sync_key)
+    mime, _ = mimetypes.guess_type(str(target))
+    if not mime:
+        mime = "audio/wav" if item.get("media_type") == "audio" else "video/mp4"
+    return FastFileResponse(path=str(target), media_type=mime)
+
+
+@app.get("/api/v1/cloud-sync/thumb/{sync_key:path}", tags=["云端自动同步"])
+def thumb_cloud_synced_video(sync_key: str) -> FileResponse:
+    """为已拉回本地的云端 MP4 提取并缓存封面缩略图，便于在「我的作品」与首页直接展示。"""
+    target, item = _resolve_cloud_synced_file(sync_key)
+    if item.get("media_type") == "audio":
+        raise HTTPException(status_code=404, detail="音频文件无视频封面")
+    thumb_dir = Path(__file__).resolve().parent.parent / "logs" / "sync_thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r"[^A-Za-z0-9_-]+", "_", sync_key).strip("_")[:64] or "item"
+    thumb_file = thumb_dir / f"{safe_key}.jpg"
+    thumb = _extract_video_thumbnail(target, thumb_file, f"cs_{safe_key}")
+    if not thumb or not thumb.is_file():
+        raise HTTPException(status_code=404, detail="无法提取视频封面")
+    return FileResponse(path=str(thumb), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.post("/api/v1/cloud-sync/copy-file/{sync_key:path}", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def copy_cloud_synced_file(request: Request, sync_key: str) -> dict[str, Any]:
+    """将已拉回本地的云端视频文件复制到系统剪贴板，方便直接粘贴发微信。"""
+    _require_local_client(request, "复制视频文件到剪贴板")
+    target, _ = _resolve_cloud_synced_file(sync_key)
+    ok, msg = system_ctrl.copy_file_to_clipboard(str(target))
+    if not ok:
+        raise HTTPException(status_code=500, detail=msg)
+    return {"ok": True, "path": str(target), "message": msg}
 
 
 @app.post("/api/v1/cloud-sync/open-folder", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])

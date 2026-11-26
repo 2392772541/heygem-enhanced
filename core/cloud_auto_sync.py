@@ -335,6 +335,18 @@ class CloudAutoSyncManager:
             self._config["synced"][key] = info
         self._save_config()
 
+    def get_synced_item(self, sync_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            raw = (self._config.get("synced") or {}).get(sync_key)
+            if not isinstance(raw, dict):
+                return None
+            lp = Path(str(raw.get("local_path") or ""))
+            return {
+                **raw,
+                "sync_key": sync_key,
+                "exists": lp.is_file() if str(lp) else False,
+            }
+
     def get_status(self) -> dict[str, Any]:
         with self._lock:
             synced_map = dict(self._config.get("synced") or {})
@@ -368,7 +380,7 @@ class CloudAutoSyncManager:
                 "last_error": self._runtime.get("last_error") or "",
                 "active_download": self._runtime.get("active_download"),
                 "synced_count": len(items),
-                "synced_items": items[:40],
+                "synced_items": items[:120],
                 "recent_events": list(self._runtime.get("recent_events") or [])[-20:],
             }
 
