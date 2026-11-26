@@ -1379,14 +1379,60 @@ def api_tts_capabilities() -> dict[str, Any]:
         }
 
 
+def _load_registered_personal_voices() -> list[dict[str, Any]]:
+    """只读读取 D:\\IndexTTS2-Training\\voices\\registry.json，供本地工作台列出已就绪的专属微调声音。"""
+    reg_raw = (os.getenv("INDEX_TTS_VOICES_REGISTRY") or os.getenv("MYVOICE_REGISTRY_PATH") or "").strip()
+    reg_path = Path(reg_raw) if reg_raw else Path(r"D:\IndexTTS2-Training\voices\registry.json")
+    if not reg_path.is_file():
+        return []
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for v in data.get("voices") or []:
+        if not isinstance(v, dict) or str(v.get("status") or "").lower() != "ready":
+            continue
+        vid = str(v.get("voice_id") or "").strip()
+        dname = str(v.get("display_name") or vid).strip()
+        models = v.get("models") if isinstance(v.get("models"), dict) else {}
+        def_mk = str(v.get("default_model_key") or "best").strip()
+        prompts = v.get("prompts") if isinstance(v.get("prompts"), dict) else {}
+        def_pk = str(v.get("default_prompt_key") or "natural").strip()
+        def_prompt_path = str((prompts.get(def_pk) or {}).get("path") or "").strip()
+        m_entry = models.get(def_mk) or next((mv for mv in models.values() if isinstance(mv, dict)), None)
+        if not isinstance(m_entry, dict):
+            continue
+        cfg_p = str(m_entry.get("cfg_path") or "").strip()
+        gpt_p = str(m_entry.get("gpt_path") or "").strip()
+        if not cfg_p or not Path(cfg_p).is_file() or not gpt_p or not Path(gpt_p).is_file():
+            continue
+        m_label = str(m_entry.get("label") or def_mk).strip()
+        out.append(
+            {
+                "voice_id": vid,
+                "display_name": dname,
+                "model_key": def_mk,
+                "label": f"{dname} · {m_label}",
+                "cfg_path": cfg_p.replace("\\", "/"),
+                "prompt_path": def_prompt_path.replace("\\", "/"),
+            }
+        )
+    return out
+
+
 @app.get("/api/v1/tts/config", tags=["IndexTTS2 语音工作台"], dependencies=[Depends(_verify_api_key)])
 def api_get_tts_config() -> dict[str, Any]:
+    reg_voices = _load_registered_personal_voices()
     try:
-        return _proxy_tts_json("GET", "/v1/tts/config", timeout=4.0)
+        res = _proxy_tts_json("GET", "/v1/tts/config", timeout=4.0)
+        if isinstance(res, dict):
+            res["registered_voices"] = reg_voices
+        return res
     except HTTPException:
         cfg_path = Path(__file__).resolve().parent.parent / "adapter" / "config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig")) if cfg_path.exists() else {}
-        return {"code": 0, "config": cfg, "offline_fallback": True}
+        return {"code": 0, "config": cfg, "registered_voices": reg_voices, "offline_fallback": True}
 
 
 @app.put("/api/v1/tts/config", tags=["IndexTTS2 语音工作台"], dependencies=[Depends(_verify_api_key)])
@@ -2704,6 +2750,7 @@ def media_stream_voice(voice_id: int) -> FileResponse:
 
 class CloudSyncConfigRequest(BaseModel):
     enabled: bool | None = None
+    sync_audio: bool | None = None
     cloud_url: str | None = None
     cloud_token: str | None = None
     save_dir: str | None = None
@@ -2726,6 +2773,7 @@ def update_cloud_sync_config(req: CloudSyncConfigRequest) -> dict[str, Any]:
     try:
         st = cloud_sync_manager.update_config(
             enabled=req.enabled,
+            sync_audio=req.sync_audio,
             cloud_url=req.cloud_url,
             cloud_token=req.cloud_token,
             save_dir=req.save_dir,
@@ -2763,6 +2811,24 @@ def manual_pull_cloud_video(video_id: int) -> dict[str, Any]:
 
     threading.Thread(target=_run, name=f"CloudSyncPull-{video_id}", daemon=True).start()
     return {"ok": True, "message": f"已开始 8 线程高速拉回云端 #{video_id} 号视频"}
+
+
+@app.post("/api/v1/cloud-sync/pull-audio/{audio_id}", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])
+def manual_pull_cloud_audio(audio_id: int) -> dict[str, Any]:
+    st = cloud_sync_manager.get_status()
+    if not st.get("cloud_url"):
+        raise HTTPException(status_code=400, detail="请先填写并保存云端创作台网址")
+    if st.get("active_download"):
+        raise HTTPException(status_code=409, detail="当前正有文件在拉取中，请稍候再点")
+
+    def _run() -> None:
+        try:
+            cloud_sync_manager.pull_audio_now(audio_id, force=True)
+        except Exception as exc:
+            cloud_sync_manager._log_event(f"手动拉取音频 #{audio_id} 失败：{exc}")
+
+    threading.Thread(target=_run, name=f"CloudSyncPullAudio-{audio_id}", daemon=True).start()
+    return {"ok": True, "message": f"已开始拉回云端 #{audio_id} 号配音音频"}
 
 
 @app.post("/api/v1/cloud-sync/open-folder", tags=["云端自动同步"], dependencies=[Depends(_verify_api_key)])

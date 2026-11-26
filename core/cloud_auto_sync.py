@@ -144,6 +144,36 @@ def _verify_mp4_basic(path: Path) -> tuple[bool, str]:
         return True, f"ffprobe跳过({exc})"
 
 
+def _verify_audio_basic(path: Path) -> tuple[bool, str]:
+    """基础音频完整性验证：检查文件大小及（若存在 ffprobe）解析音频轨。"""
+    if not path.is_file() or path.stat().st_size < 512:
+        return False, "音频文件体积异常过小"
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe:
+        return True, "size_ok"
+    try:
+        res = subprocess.run(
+            [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if res.returncode != 0:
+            return False, (res.stderr or "ffprobe 音频校验失败")[:160]
+        info = json.loads(res.stdout or "{}")
+        streams = info.get("streams") or []
+        has_a = any(s.get("codec_type") == "audio" for s in streams)
+        dur = float((info.get("format") or {}).get("duration") or 0)
+        if not has_a or dur <= 0.05:
+            return False, "未检测到有效音频轨或时长异常"
+        return True, f"音频 · {dur:.1f}s"
+    except Exception as exc:
+        return True, f"ffprobe跳过({exc})"
+
+
 def _send_windows_toast(title: str, body: str) -> None:
     """无黑窗弹出 Windows 右下角静默提示气泡（失败自动忽略，绝不影响同步主流程）。"""
     if os.name != "nt":
@@ -182,6 +212,7 @@ class CloudAutoSyncManager:
 
         self._config: dict[str, Any] = {
             "enabled": False,
+            "sync_audio": True,
             "cloud_url": "",
             "cloud_token": "",
             "save_dir": str(DEFAULT_SAVE_DIR),
@@ -189,12 +220,14 @@ class CloudAutoSyncManager:
             "poll_interval": 15,
             "threads": 8,
             "notify_desktop": True,
-            "synced": {},  # key -> {video_id, name, local_path, size_mb, saved_at, meta}
+            "synced": {},  # key -> {video_id/audio_id, media_type, name, local_path, size_mb, saved_at, meta}
         }
         self._runtime: dict[str, Any] = {
             "connected": False,
             "cloud_video_count": 0,
             "cloud_videos": [],
+            "cloud_audio_count": 0,
+            "cloud_audios": [],
             "last_check_at": 0.0,
             "last_error": "",
             "active_download": None,
@@ -218,7 +251,7 @@ class CloudAutoSyncManager:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 with self._lock:
-                    for k in ("enabled", "cloud_url", "cloud_token", "save_dir", "quality", "poll_interval", "threads", "notify_desktop"):
+                    for k in ("enabled", "sync_audio", "cloud_url", "cloud_token", "save_dir", "quality", "poll_interval", "threads", "notify_desktop"):
                         if k in raw:
                             self._config[k] = raw[k]
                     if isinstance(raw.get("synced"), dict):
@@ -258,6 +291,7 @@ class CloudAutoSyncManager:
         self,
         *,
         enabled: bool | None = None,
+        sync_audio: bool | None = None,
         cloud_url: str | None = None,
         cloud_token: str | None = None,
         save_dir: str | None = None,
@@ -268,6 +302,8 @@ class CloudAutoSyncManager:
         with self._lock:
             if enabled is not None:
                 self._config["enabled"] = bool(enabled)
+            if sync_audio is not None:
+                self._config["sync_audio"] = bool(sync_audio)
             if cloud_url is not None:
                 u = cloud_url.strip().rstrip("/")
                 if u and not u.startswith(("http://", "https://")):
@@ -315,20 +351,24 @@ class CloudAutoSyncManager:
             items.sort(key=lambda x: float(x.get("saved_at") or 0), reverse=True)
             return {
                 "enabled": bool(self._config.get("enabled")),
+                "sync_audio": bool(self._config.get("sync_audio", True)),
                 "cloud_url": self._config.get("cloud_url") or "",
                 "has_token": bool(self._config.get("cloud_token")),
                 "save_dir": self._config.get("save_dir") or str(DEFAULT_SAVE_DIR),
+                "audio_save_dir": str(Path(self._config.get("save_dir") or str(DEFAULT_SAVE_DIR)) / "音频"),
                 "quality": self._config.get("quality") or "compact",
                 "poll_interval": int(self._config.get("poll_interval") or 15),
                 "notify_desktop": bool(self._config.get("notify_desktop", True)),
                 "connected": bool(self._runtime.get("connected")),
                 "cloud_video_count": int(self._runtime.get("cloud_video_count") or 0),
                 "cloud_videos": list(self._runtime.get("cloud_videos") or []),
+                "cloud_audio_count": int(self._runtime.get("cloud_audio_count") or 0),
+                "cloud_audios": list(self._runtime.get("cloud_audios") or []),
                 "last_check_at": float(self._runtime.get("last_check_at") or 0.0),
                 "last_error": self._runtime.get("last_error") or "",
                 "active_download": self._runtime.get("active_download"),
                 "synced_count": len(items),
-                "synced_items": items[:30],
+                "synced_items": items[:40],
                 "recent_events": list(self._runtime.get("recent_events") or [])[-20:],
             }
 
@@ -450,11 +490,57 @@ class CloudAutoSyncManager:
         self._download_one_video(cloud_url, target, save_dir, quality, threads, notify, key)
         return {"ok": True, "video_id": video_id, "sync_key": key}
 
+    def _audio_sync_key(self, asset: dict[str, Any]) -> str:
+        aid = int(asset.get("id") or 0)
+        created = str(asset.get("created_at") or "").strip()
+        return f"audio:{aid}:{created}"
+
+    def _build_local_audio_filename(self, asset: dict[str, Any], audio_dir: Path | None = None) -> str:
+        """清爽可读音频文件名：沿用音频名称，撞名时追加编号。"""
+        aid = int(asset.get("id") or 0)
+        raw_name = str(asset.get("name") or "").strip()
+        raw_fp = str(asset.get("file_path") or "").strip()
+        ext = Path(raw_fp).suffix.lower() if raw_fp else ".wav"
+        if ext not in (".wav", ".mp3", ".m4a", ".flac", ".ogg"):
+            ext = ".wav"
+        clean = _safe_filename(raw_name, fallback=f"配音_{aid}")
+        cand = f"{clean}{ext}"
+        if audio_dir is not None and (audio_dir / cand).exists():
+            cand = f"{clean}_{aid}{ext}"
+        return cand
+
+    def pull_audio_now(self, audio_id: int, force: bool = True) -> dict[str, Any]:
+        """手动立即拉取指定编号的云端音频（支持拉回配音或上传音频）。"""
+        with self._lock:
+            cloud_url = (self._config.get("cloud_url") or "").strip().rstrip("/")
+            save_dir = Path(self._config.get("save_dir") or str(DEFAULT_SAVE_DIR))
+            threads = max(1, min(8, int(self._config.get("threads") or 8)))
+            notify = bool(self._config.get("notify_desktop", True))
+        if not cloud_url:
+            raise RuntimeError("请先填写并保存云端创作台网址")
+        status, _, body, _ = self._http_request(f"{cloud_url}/api/audio-assets", timeout=15)
+        if status != 200:
+            raise RuntimeError(f"云端返回 HTTP {status}")
+        payload = json.loads(body.decode("utf-8"))
+        assets = payload.get("assets", []) if isinstance(payload, dict) else payload
+        target = next((a for a in assets if isinstance(a, dict) and int(a.get("id") or 0) == int(audio_id)), None)
+        if not target:
+            raise RuntimeError(f"云端未找到 #{audio_id} 号音频")
+        key = self._audio_sync_key(target)
+        if force:
+            with self._lock:
+                self._config["synced"].pop(key, None)
+            self._save_config()
+        audio_dir = save_dir / "音频"
+        self._download_one_audio(cloud_url, target, audio_dir, threads, notify, key)
+        return {"ok": True, "audio_id": audio_id, "sync_key": key}
+
     def sync_once(self) -> dict[str, Any]:
         with self._lock:
             cloud_url = (self._config.get("cloud_url") or "").strip().rstrip("/")
             save_dir = Path(self._config.get("save_dir") or str(DEFAULT_SAVE_DIR))
             quality = str(self._config.get("quality") or "compact")
+            sync_audio = bool(self._config.get("sync_audio", True))
             threads = max(1, min(12, int(self._config.get("threads") or 8)))
             notify = bool(self._config.get("notify_desktop", True))
 
@@ -549,7 +635,169 @@ class CloudAutoSyncManager:
                     self._runtime["last_error"] = f"视频 #{v.get('id')} 同步出错：{exc}"
                     self._runtime["active_download"] = None
 
-        return {"ok": True, "cloud_done": len(done_videos), "pulled": pulled}
+        # 同步拉取云端生成的配音音频（只自动拉取 source_type=tts/indextts2，避免把本地上传的录音又拉回来）
+        pulled_audios = 0
+        try:
+            st_a, _, body_a, _ = self._http_request(f"{cloud_url}/api/audio-assets", timeout=15)
+            if st_a == 200:
+                payload_a = json.loads(body_a.decode("utf-8"))
+                raw_assets = payload_a.get("assets", []) if isinstance(payload_a, dict) else payload_a
+                assets = [a for a in raw_assets if isinstance(a, dict) and int(a.get("id") or 0) > 0]
+                tts_assets = [a for a in assets if str(a.get("source_type") or "").lower() in ("tts", "indextts2")]
+                with self._lock:
+                    synced_map = self._config.get("synced") or {}
+                    self._runtime["cloud_audio_count"] = len(tts_assets)
+                    self._runtime["cloud_audios"] = [
+                        {
+                            "id": int(a.get("id") or 0),
+                            "name": str(a.get("name") or f"音频 #{a.get('id')}"),
+                            "source_type": str(a.get("source_type") or "tts"),
+                            "duration": round(float(a.get("duration") or 0.0), 1),
+                            "created_at": a.get("created_at"),
+                            "sync_key": self._audio_sync_key(a),
+                            "synced": self._audio_sync_key(a) in synced_map,
+                        }
+                        for a in assets[:30]
+                    ]
+                if sync_audio:
+                    audio_dir = save_dir / "音频"
+                    # 按 id 降序优先拉取最新生成的云端配音，确保刚配好的第一时间落盘
+                    for a in sorted(tts_assets, key=lambda x: int(x.get("id") or 0), reverse=True):
+                        if self._stop_event.is_set():
+                            break
+                        akey = self._audio_sync_key(a)
+                        with self._lock:
+                            already_a = self._config["synced"].get(akey)
+                        if already_a:
+                            continue
+                        try:
+                            self._download_one_audio(cloud_url, a, audio_dir, min(threads, 4), notify, akey)
+                            pulled_audios += 1
+                        except Exception as exc:
+                            self._log_event(f"拉取配音 #{a.get('id')} 暂遇波动（下轮自动重试）：{exc}")
+                            with self._lock:
+                                self._runtime["active_download"] = None
+        except Exception:
+            pass
+
+        return {"ok": True, "cloud_done": len(done_videos), "pulled": pulled, "pulled_audios": pulled_audios}
+
+    def _download_one_audio(
+        self,
+        cloud_url: str,
+        asset: dict[str, Any],
+        audio_dir: Path,
+        threads: int,
+        notify: bool,
+        sync_key: str,
+    ) -> None:
+        aid = int(asset.get("id") or 0)
+        aname = str(asset.get("name") or f"配音#{aid}")
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        dl_rel = str(asset.get("download_url") or f"/api/media/audio-asset/{aid}?download=1")
+        dl_url = _join_cloud_url(cloud_url, dl_rel)
+
+        with self._lock:
+            self._runtime["active_download"] = {
+                "video_id": aid,
+                "audio_id": aid,
+                "media_type": "audio",
+                "name": aname,
+                "stage": "正在拉回云端配音...",
+                "percent": 0.0,
+                "downloaded_mb": 0.0,
+                "total_mb": 0.0,
+                "speed_mbs": 0.0,
+            }
+
+        dst_name = self._build_local_audio_filename(asset, audio_dir=audio_dir)
+        dst = audio_dir / dst_name
+        part = dst.with_name(dst.name + ".part")
+
+        self._log_event(f"开始拉回云端配音 #{aid} -> {dst_name}")
+        t0 = time.time()
+        done_bytes = 0
+        total = 0
+        auth_dl_url, base_auth_hdr = self._prepare_request(dl_url)
+
+        # 直接使用 GET 流式拉取（兼容不支持 HEAD 的音频下载接口）
+        last_exc: Exception | None = None
+        downloaded_ok = False
+        for opener in self._build_openers():
+            try:
+                req = urllib.request.Request(auth_dl_url, headers=dict(base_auth_hdr))
+                with opener.open(req, timeout=180) as resp, open(part, "wb") as wf:
+                    total = int(resp.headers.get("Content-Length") or "0")
+                    done_bytes = 0
+                    while True:
+                        if self._stop_event.is_set():
+                            raise RuntimeError("同步服务停止")
+                        block = resp.read(256 * 1024)
+                        if not block:
+                            break
+                        wf.write(block)
+                        done_bytes += len(block)
+                        dt = max(0.05, time.time() - t0)
+                        mb_done = done_bytes / 1048576.0
+                        mb_tot = (total / 1048576.0) if total > 0 else mb_done
+                        pct = round(min(100.0, done_bytes * 100.0 / total), 1) if total > 0 else 50.0
+                        with self._lock:
+                            self._runtime["active_download"] = {
+                                "video_id": aid,
+                                "audio_id": aid,
+                                "media_type": "audio",
+                                "name": aname,
+                                "stage": "拉回云端配音中...",
+                                "percent": pct,
+                                "downloaded_mb": round(mb_done, 2),
+                                "total_mb": round(mb_tot, 2),
+                                "speed_mbs": round(mb_done / dt, 2),
+                            }
+                downloaded_ok = True
+                break
+            except urllib.error.HTTPError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+        if not downloaded_ok:
+            assert last_exc is not None
+            raise last_exc
+
+        if total > 0 and part.stat().st_size != total:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"音频体积不匹配 ({part.stat().st_size} != {total})")
+
+        ok_a, meta_desc = _verify_audio_basic(part)
+        if not ok_a:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"音频校验未通过：{meta_desc}")
+
+        os.replace(part, dst)
+        dt = max(0.05, time.time() - t0)
+        actual_size = dst.stat().st_size
+        spd = (actual_size / 1048576.0) / dt
+        size_mb = round(actual_size / 1048576.0, 2)
+
+        self.mark_already_synced(sync_key, {
+            "audio_id": aid,
+            "media_type": "audio",
+            "name": aname,
+            "local_path": str(dst),
+            "size_mb": size_mb,
+            "saved_at": time.time(),
+            "meta": f"{meta_desc} · 均速 {spd:.2f} MB/s",
+        })
+        with self._lock:
+            self._runtime["active_download"] = None
+            for ca in self._runtime.get("cloud_audios") or []:
+                if ca.get("sync_key") == sync_key:
+                    ca["synced"] = True
+        self._log_event(f"云端配音 #{aid} 已保存到 {dst.name}（{size_mb} MB，均速 {spd:.2f} MB/s）")
+        if notify:
+            _send_windows_toast(
+                "云端新配音已自动下载完成",
+                f"{dst.name}（{size_mb} MB）已保存到 {audio_dir}",
+            )
 
     def _download_one_video(
         self,

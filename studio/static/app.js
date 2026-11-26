@@ -1580,12 +1580,56 @@ function syncTuneSummaryAll() {
   }
 }
 
+function syncPostprocessFromCreate(val) {
+  const mode = val || "fixB";
+  const a = document.getElementById("createPostprocessMode");
+  const b = document.getElementById("ttsPostprocessMode");
+  if (a) a.value = mode;
+  if (b) b.value = mode;
+  syncTuneSummaryAll();
+}
+
+function syncPostprocessFromStudio(val) {
+  syncPostprocessFromCreate(val);
+}
+
+function syncPersonalVoiceFromCreate(val) {
+  const v = val || "";
+  const a = document.getElementById("createPersonalVoiceSelect");
+  const b = document.getElementById("ttsPersonalVoiceSelect");
+  if (a) a.value = v;
+  if (b) b.value = v;
+  syncTuneSummaryAll();
+}
+
+function syncPersonalVoiceFromStudio(val) {
+  syncPersonalVoiceFromCreate(val);
+}
+
+function populateRegisteredPersonalVoices(list) {
+  const items = Array.isArray(list) ? list : [];
+  state.registeredVoices = items;
+  const html = `<option value="">按数字人绑定自动匹配</option>` +
+    items.map((v) => `<option value="${esc(v.cfg_path || "")}">${esc(v.label || v.display_name)}（已就绪）</option>`).join("");
+  ["createPersonalVoiceSelect", "ttsPersonalVoiceSelect"].forEach((id) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const prev = sel.value || "";
+    sel.innerHTML = html;
+    if (prev && items.some((x) => String(x.cfg_path || "") === prev)) sel.value = prev;
+    else sel.value = "";
+  });
+}
+
 function collectTtsParams() {
   const vec = EMO_LABELS.map((_, i) => Number(document.getElementById(`emoSlider${i}`)?.value || 0));
-  return {
+  const ppMode = document.getElementById("ttsPostprocessMode")?.value || document.getElementById("createPostprocessMode")?.value || "fixB";
+  const chosenCfg = (document.getElementById("ttsPersonalVoiceSelect")?.value || document.getElementById("createPersonalVoiceSelect")?.value || "").trim();
+  const out = {
     model_version: document.getElementById("ttsModelVersion").value,
     lang: document.getElementById("ttsLang").value,
     speed: Number(document.getElementById("ttsSpeed").value),
+    postprocess_mode: ppMode,
     emo_mode: state.emoMode,
     emo_alpha: Number(document.getElementById("ttsEmoAlpha").value),
     emo_vector: vec,
@@ -1601,12 +1645,15 @@ function collectTtsParams() {
     chunk_size: Number(document.getElementById("ttsChunk").value),
     auto_fast_on_long_text: document.getElementById("ttsAutoFast").checked,
   };
+  if (chosenCfg) out.cfg_path = chosenCfg;
+  return out;
 }
 
 function applyTtsParamsToForm(p) {
   if (!p) return;
   if (p.model_version) document.getElementById("ttsModelVersion").value = p.model_version;
   if (p.lang) document.getElementById("ttsLang").value = p.lang;
+  if (p.postprocess_mode) syncPostprocessFromCreate(p.postprocess_mode);
   if (hasVal(p.speed)) syncSpeedFromCreate(p.speed);
   if (p.emo_mode) setEmoMode(p.emo_mode);
   if (hasVal(p.emo_alpha)) { document.getElementById("ttsEmoAlpha").value = p.emo_alpha; syncRangeVal("ttsEmoAlpha", "valEmoAlpha", ""); }
@@ -1694,6 +1741,7 @@ async function saveAsGlobalTtsConfig() {
     index_tts_model_version: p.model_version,
     index_tts_lang: p.lang,
     index_tts_speed: p.speed,
+    index_tts_postprocess_mode: p.postprocess_mode || "fixB",
     index_tts_emo_mode: p.emo_mode,
     index_tts_emo_alpha: p.emo_alpha,
     index_tts_emo_vector: p.emo_vector,
@@ -3345,6 +3393,75 @@ async function runApiTest() {
 
 // ==================== 云端自动收片（整合于「我的作品」顶部单行条） ====================
 
+function setCloudRemoteTab(tab) {
+  state.cloudRemoteTab = tab === "audios" ? "audios" : "videos";
+  document.querySelectorAll("#cloudRemoteTypeTabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.rtype === state.cloudRemoteTab);
+  });
+  renderCloudRemoteList(state.lastCloudSyncStatus || {});
+}
+
+function renderCloudRemoteList(st) {
+  const remoteSub = document.getElementById("cloudRemoteCountSub");
+  const remoteListEl = document.getElementById("cloudRemoteList");
+  if (!remoteListEl) return;
+  const tab = state.cloudRemoteTab || "videos";
+  const busyNow = Boolean(st.active_download);
+
+  if (tab === "audios") {
+    const remoteAudios = st.cloud_audios || [];
+    if (remoteSub) remoteSub.textContent = `${remoteAudios.length} 条`;
+    if (!remoteAudios.length) {
+      remoteListEl.innerHTML = `<div class="empty-box">${st.connected ? "云端目前暂无音频记录" : "连接云端后将列出云端配音音频"}</div>`;
+      return;
+    }
+    remoteListEl.innerHTML = remoteAudios.map((ca) => {
+      const isTts = ca.source_type === "tts" || ca.source_type === "indextts2";
+      const srcTag = isTts ? `<span class="state-tag st-pending">云端配音</span>` : `<span class="state-tag st-muted">已上传</span>`;
+      const badge = ca.synced ? `<span class="state-tag st-success">已拉回</span>` : `<span class="state-tag st-muted">未拉回</span>`;
+      const btnLabel = ca.synced ? "重新拉回" : "手动拉回";
+      return `
+        <div class="cloud-item-row">
+          <div style="min-width:0;flex:1;">
+            <div class="inline-row" style="gap:6px;">
+              <strong style="font-size:13px;word-break:break-all;">#${ca.id} ${esc(ca.name)}</strong>
+              ${srcTag}
+              ${badge}
+            </div>
+            <div class="avatar-sub">时长 ${fmtDuration(ca.duration)}</div>
+          </div>
+          <button class="btn btn-xs ${ca.synced ? "btn-secondary" : "btn-primary"}" ${busyNow ? "disabled" : ""} onclick="pullCloudAudioNow(${ca.id})">${btnLabel}</button>
+        </div>`;
+    }).join("");
+    return;
+  }
+
+  const remoteVids = st.cloud_videos || [];
+  if (remoteSub) remoteSub.textContent = `${remoteVids.length} 条`;
+  if (!remoteVids.length) {
+    remoteListEl.innerHTML = `<div class="empty-box">${st.connected ? "云端目前暂无已完成视频" : "连接云端后将列出云端作品"}</div>`;
+    return;
+  }
+  remoteListEl.innerHTML = remoteVids.map((cv) => {
+    const badge = cv.synced ? `<span class="state-tag st-success">已拉回</span>` : `<span class="state-tag st-muted">未拉回</span>`;
+    const btnLabel = cv.synced ? "重新拉回" : "手动拉回";
+    const sz = cv.drive_compact_size_mb
+      ? `压小版 ${cv.drive_compact_size_mb}M / 原片 ${cv.file_size_mb || "?"}M`
+      : `原片 ${cv.file_size_mb || "?"}M`;
+    return `
+      <div class="cloud-item-row">
+        <div style="min-width:0;flex:1;">
+          <div class="inline-row" style="gap:6px;">
+            <strong style="font-size:13px;word-break:break-all;">#${cv.id} ${esc(cv.name)}</strong>
+            ${badge}
+          </div>
+          <div class="avatar-sub">形象：${esc(cv.model_name || "-")} · ${fmtDuration(cv.duration)} · ${sz}</div>
+        </div>
+        <button class="btn btn-xs ${cv.synced ? "btn-secondary" : "btn-primary"}" ${busyNow ? "disabled" : ""} onclick="pullCloudVideoNow(${cv.id})">${btnLabel}</button>
+      </div>`;
+  }).join("");
+}
+
 function toggleCloudSyncDrawer() {
   state.cloudSyncDrawerOpen = !state.cloudSyncDrawerOpen;
   const drawer = document.getElementById("cloudSyncDrawer");
@@ -3360,6 +3477,7 @@ async function refreshCloudSyncStatus(fillInputs = false) {
   try {
     const res = await api("/api/v1/cloud-sync/status", { timeoutMs: 8000 });
     const st = res.status || {};
+    state.lastCloudSyncStatus = st;
     state.cloudSyncActive = Boolean(st.active_download);
 
     if (fillInputs) {
@@ -3367,10 +3485,12 @@ async function refreshCloudSyncStatus(fillInputs = false) {
       const dirInput = document.getElementById("cloudSyncSaveDirInput");
       const qualSel = document.getElementById("cloudSyncQualitySelect");
       const enToggle = document.getElementById("cloudSyncEnabledToggle");
+      const auToggle = document.getElementById("cloudSyncAudioToggle");
       if (urlInput) urlInput.value = st.cloud_url || "";
       if (dirInput) dirInput.value = st.save_dir || "E:\\数字人视频文件";
       if (qualSel) qualSel.value = st.quality || "compact";
       if (enToggle) enToggle.checked = Boolean(st.enabled);
+      if (auToggle) auToggle.checked = st.sync_audio !== false;
     }
 
     const dot = document.getElementById("cloudSyncConnDot");
@@ -3381,8 +3501,9 @@ async function refreshCloudSyncStatus(fillInputs = false) {
     if (dot && txt) {
       if (st.active_download) {
         const ad = st.active_download;
+        const kindTxt = ad.media_type === "audio" ? "配音" : "视频";
         dot.className = "status-dot dot-accent pulse";
-        txt.textContent = `正在拉回 #${ad.video_id} ${ad.name || ""} · ${Math.round(ad.percent || 0)}%${ad.speed_mbs ? ` (${ad.speed_mbs} MB/s)` : ""}`;
+        txt.textContent = `正在拉回${kindTxt} #${ad.video_id || ad.audio_id} ${ad.name || ""} · ${Math.round(ad.percent || 0)}%${ad.speed_mbs ? ` (${ad.speed_mbs} MB/s)` : ""}`;
         stripBarWrap?.classList.remove("hidden");
         if (stripBar) stripBar.style.width = `${Math.min(100, Math.max(4, ad.percent || 0))}%`;
       } else {
@@ -3395,7 +3516,7 @@ async function refreshCloudSyncStatus(fillInputs = false) {
           txt.textContent = `已暂停自动收片 · 目录 ${st.save_dir || "E:\\数字人视频文件"}`;
         } else if (st.connected) {
           dot.className = "status-dot dot-ok";
-          txt.textContent = `已连接（云端 ${st.cloud_video_count || 0} 条，已拉回 ${st.synced_count || 0} 条）· 存至 ${st.save_dir || "E:\\数字人视频文件"}`;
+          txt.textContent = `已连接（云端 ${st.cloud_video_count || 0} 条视频、${st.cloud_audio_count || 0} 条配音，已拉回 ${st.synced_count || 0} 条）· 存至 ${st.save_dir || "E:\\数字人视频文件"}`;
         } else {
           dot.className = "status-dot dot-warn";
           txt.textContent = "云端暂未连接（后台自动重试中）";
@@ -3411,7 +3532,7 @@ async function refreshCloudSyncStatus(fillInputs = false) {
         const tEl = document.getElementById("cloudSyncActiveTitle");
         const mEl = document.getElementById("cloudSyncActiveMeta");
         const bEl = document.getElementById("cloudSyncActiveBar");
-        if (tEl) tEl.textContent = `${ad.stage || "拉回中"} · #${ad.video_id} ${ad.name || ""}`;
+        if (tEl) tEl.textContent = `${ad.stage || "拉回中"} · #${ad.video_id || ad.audio_id} ${ad.name || ""}`;
         if (mEl) mEl.textContent = ad.total_mb ? `${ad.percent || 0}% (${ad.downloaded_mb}/${ad.total_mb} MB · ${ad.speed_mbs || 0} MB/s)` : `${ad.percent || 0}%`;
         if (bEl) bEl.style.width = `${Math.min(100, Math.max(0, ad.percent || 0))}%`;
       } else {
@@ -3429,35 +3550,7 @@ async function refreshCloudSyncStatus(fillInputs = false) {
       }
     }
 
-    const remoteSub = document.getElementById("cloudRemoteCountSub");
-    const remoteListEl = document.getElementById("cloudRemoteList");
-    const remoteVids = st.cloud_videos || [];
-    if (remoteSub) remoteSub.textContent = `${remoteVids.length} 条`;
-    if (remoteListEl) {
-      if (!remoteVids.length) {
-        remoteListEl.innerHTML = `<div class="empty-box">${st.connected ? "云端目前暂无已完成视频" : "连接云端后将列出云端作品"}</div>`;
-      } else {
-        const busyNow = Boolean(st.active_download);
-        remoteListEl.innerHTML = remoteVids.map((cv) => {
-          const badge = cv.synced ? `<span class="state-tag st-success">已拉回</span>` : `<span class="state-tag st-muted">未拉回</span>`;
-          const btnLabel = cv.synced ? "重新拉回" : "手动拉回";
-          const sz = cv.drive_compact_size_mb
-            ? `压小版 ${cv.drive_compact_size_mb}M / 原片 ${cv.file_size_mb || "?"}M`
-            : `原片 ${cv.file_size_mb || "?"}M`;
-          return `
-            <div class="cloud-item-row">
-              <div style="min-width:0;flex:1;">
-                <div class="inline-row" style="gap:6px;">
-                  <strong style="font-size:13px;word-break:break-all;">#${cv.id} ${esc(cv.name)}</strong>
-                  ${badge}
-                </div>
-                <div class="avatar-sub">形象：${esc(cv.model_name || "-")} · ${fmtDuration(cv.duration)} · ${sz}</div>
-              </div>
-              <button class="btn btn-xs ${cv.synced ? "btn-secondary" : "btn-primary"}" ${busyNow ? "disabled" : ""} onclick="pullCloudVideoNow(${cv.id})">${btnLabel}</button>
-            </div>`;
-        }).join("");
-      }
-    }
+    renderCloudRemoteList(st);
 
     const cntSub = document.getElementById("cloudSyncCountSub");
     const listEl = document.getElementById("cloudSyncList");
@@ -3465,18 +3558,20 @@ async function refreshCloudSyncStatus(fillInputs = false) {
     if (cntSub) cntSub.textContent = `${st.synced_count || items.length} 条`;
     if (listEl) {
       if (!items.length) {
-        listEl.innerHTML = `<div class="empty-box">暂未拉回任何云端视频</div>`;
+        listEl.innerHTML = `<div class="empty-box">暂未拉回任何云端作品</div>`;
       } else {
         listEl.innerHTML = items.map((it) => {
-          const fname = (it.local_path || "").split(/[\\/]/).pop() || it.name || `#${it.video_id}`;
+          const fname = (it.local_path || "").split(/[\\/]/).pop() || it.name || `#${it.video_id || it.audio_id}`;
           const savedAt = it.saved_at ? new Date(it.saved_at * 1000).toLocaleString("zh-CN") : "";
           const escapedPath = (it.local_path || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+          const kindTag = it.media_type === "audio" ? `<span class="state-tag st-pending">音频</span>` : `<span class="state-tag st-muted">视频</span>`;
           const statusTag = it.exists ? `<span class="state-tag st-success">在本地</span>` : `<span class="state-tag st-muted">已移动</span>`;
           return `
             <div class="cloud-item-row">
               <div style="min-width:0;flex:1;">
                 <div class="inline-row" style="gap:6px;">
                   <strong style="font-size:13px;word-break:break-all;">${esc(fname)}</strong>
+                  ${kindTag}
                   ${statusTag}
                 </div>
                 <div class="avatar-sub">${it.size_mb || 0} MB${savedAt ? ` · ${savedAt}` : ""}</div>
@@ -3500,6 +3595,7 @@ async function saveCloudSyncConfig() {
   const save_dir = (document.getElementById("cloudSyncSaveDirInput")?.value || "").trim() || "E:\\数字人视频文件";
   const quality = document.getElementById("cloudSyncQualitySelect")?.value || "compact";
   const enabled = Boolean(document.getElementById("cloudSyncEnabledToggle")?.checked);
+  const sync_audio = Boolean(document.getElementById("cloudSyncAudioToggle")?.checked);
   if (enabled && !cloud_url) return toast("请先填入云端创作台网址", "error");
   const btn = document.getElementById("btnSaveCloudSync");
   if (btn) btn.disabled = true;
@@ -3507,9 +3603,9 @@ async function saveCloudSyncConfig() {
     await api("/api/v1/cloud-sync/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, cloud_url, save_dir, quality }),
+      body: JSON.stringify({ enabled, sync_audio, cloud_url, save_dir, quality }),
     });
-    toast(enabled ? "已开启云端自动收片" : "已暂停云端自动收片", "success", 2600);
+    toast(enabled ? "已开启云端自动收片与配音同步" : "已暂停云端自动收片", "success", 2600);
     await refreshCloudSyncStatus(true);
   } catch (err) {
     toast(`保存失败：${err.message}`, "error");
@@ -3521,7 +3617,7 @@ async function saveCloudSyncConfig() {
 async function triggerCloudSyncNow() {
   try {
     await api("/api/v1/cloud-sync/sync-now", { method: "POST" });
-    toast("已开始检测云端新作品...", "success", 2200);
+    toast("已开始检测云端新作品与配音...", "success", 2200);
     setTimeout(() => refreshCloudSyncStatus(false), 1200);
   } catch (err) {
     toast(err.message, "error");
@@ -3531,7 +3627,18 @@ async function triggerCloudSyncNow() {
 async function pullCloudVideoNow(videoId) {
   try {
     const res = await api(`/api/v1/cloud-sync/pull/${videoId}`, { method: "POST" });
-    toast(res.message || `已开始拉回 #${videoId} 号作品`, "success", 2600);
+    toast(res.message || `已开始拉回 #${videoId} 号视频`, "success", 2600);
+    state.cloudSyncActive = true;
+    setTimeout(() => refreshCloudSyncStatus(false), 1000);
+  } catch (err) {
+    toast(`拉取失败：${err.message}`, "error");
+  }
+}
+
+async function pullCloudAudioNow(audioId) {
+  try {
+    const res = await api(`/api/v1/cloud-sync/pull-audio/${audioId}`, { method: "POST" });
+    toast(res.message || `已开始拉回 #${audioId} 号配音`, "success", 2600);
     state.cloudSyncActive = true;
     setTimeout(() => refreshCloudSyncStatus(false), 1000);
   } catch (err) {
@@ -3566,10 +3673,12 @@ async function boot() {
   try {
     const cfgRes = await api("/api/v1/tts/config");
     const cfg = cfgRes.config || cfgRes.data || {};
+    populateRegisteredPersonalVoices(cfgRes.registered_voices || []);
     applyTtsParamsToForm({
       model_version: cfg.index_tts_model_version,
       lang: cfg.index_tts_lang,
       speed: cfg.index_tts_speed,
+      postprocess_mode: cfg.index_tts_postprocess_mode || "fixB",
       emo_mode: cfg.index_tts_emo_mode,
       emo_alpha: cfg.index_tts_emo_alpha,
       emo_vector: cfg.index_tts_emo_vector,
